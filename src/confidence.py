@@ -4,6 +4,21 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+SOURCE_PENALTIES: dict[str, int] = {
+    "public_experimental": 0,
+    "experimental": 0,
+    "experimental_test": 2,
+    "computed_database": 10,
+    "computed": 10,
+    "supplier_sheet": 12,
+    "sustainability_sheet": 18,
+    "procurement_sheet": 18,
+    "public_reference": 15,
+    "predicted": 20,
+    "demo_enriched": 25,
+    "unknown": 20,
+}
+
 
 def confidence_score(row: pd.Series, pred_info: dict, bundle: dict) -> dict:
     pred = max(float(pred_info["prediction"]), 1.0)
@@ -23,16 +38,8 @@ def confidence_score(row: pd.Series, pred_info: dict, bundle: dict) -> dict:
     missing_data_penalty = missing_count * 3
 
     # Penalty 3: Source type reliability
-    source = str(row.get("source_type", "predicted")).lower()
-    source_penalties = {
-        "experimental": 0,
-        "computed": 5,
-        "supplier_sheet": 10,
-        "public_reference": 15,
-        "predicted": 20,
-        "demo_enriched": 25,
-    }
-    source_risk_penalty = source_penalties.get(source, 15)
+    source = str(row.get("source_type", "unknown")).lower()
+    source_risk_penalty = SOURCE_PENALTIES.get(source, 15)
 
     # Penalty 4: Out-of-distribution detection via z-score
     feature_cols = bundle.get("feature_cols", [])

@@ -6,7 +6,8 @@ Maps arbitrary uploaded CSV columns to MatIntel standard fields using:
 3. Fuzzy match via difflib (confidence 60-85)
 4. Unmatched columns → "ignore"
 
-Also handles unit conversions detected from column names.
+Also handles unit conversions detected from column names and source type
+classification with ML eligibility logic.
 """
 
 from __future__ import annotations
@@ -53,6 +54,62 @@ STANDARD_FIELDS: list[str] = [
     "prediction_confidence_score",
     "notes",
 ]
+
+# ── Source type profiles ─────────────────────────────────────────────────────
+
+SOURCE_TYPE_PROFILES: dict[str, dict] = {
+    "public_experimental": {
+        "trust": 95,
+        "ml_eligible": True,
+        "ml_condition": "Labelled mechanical properties present",
+        "usage": "ML training + decision support",
+        "description": "Peer-reviewed or curated experimental measurements (e.g. matminer, NIMS).",
+    },
+    "experimental_test": {
+        "trust": 90,
+        "ml_eligible": True,
+        "ml_condition": "Composition + measured property columns present",
+        "usage": "ML training + decision support",
+        "description": "In-house or third-party test reports with measured properties.",
+    },
+    "supplier_sheet": {
+        "trust": 70,
+        "ml_eligible": False,
+        "ml_condition": "Not eligible — supplier-reported values require independent verification",
+        "usage": "Decision support only (screening, comparison)",
+        "description": "Technical data sheets from material suppliers.",
+    },
+    "computed_database": {
+        "trust": 60,
+        "ml_eligible": False,
+        "ml_condition": "Not eligible — computed values, not measured",
+        "usage": "Reference / screening only",
+        "description": "Computationally derived properties (DFT, MD, CALPHAD).",
+    },
+    "sustainability_sheet": {
+        "trust": 65,
+        "ml_eligible": False,
+        "ml_condition": "Not eligible — sustainability data only, no mechanical properties",
+        "usage": "Sustainability scoring only",
+        "description": "LCA data, EPDs, recycled content declarations.",
+    },
+    "procurement_sheet": {
+        "trust": 60,
+        "ml_eligible": False,
+        "ml_condition": "Not eligible — cost/supply data only",
+        "usage": "Cost and supply-risk scoring only",
+        "description": "Procurement pricing, lead times, supplier risk assessments.",
+    },
+    "unknown": {
+        "trust": 40,
+        "ml_eligible": False,
+        "ml_condition": "Not eligible — source provenance unknown",
+        "usage": "Manual review required before use",
+        "description": "Unverified or unclassified data source.",
+    },
+}
+
+ALL_SOURCE_TYPES = list(SOURCE_TYPE_PROFILES.keys())
 
 SCHEMA_ALIASES: dict[str, list[str]] = {
     "yield_strength_mpa": [
@@ -167,7 +224,6 @@ def suggest_schema_mapping(uploaded_df: pd.DataFrame) -> pd.DataFrame:
     for col in uploaded_df.columns:
         norm = _normalize(col)
 
-        # 1. Exact standard field match
         matched = False
         for sf in STANDARD_FIELDS:
             if _normalize(sf) == norm:
@@ -182,7 +238,6 @@ def suggest_schema_mapping(uploaded_df: pd.DataFrame) -> pd.DataFrame:
         if matched:
             continue
 
-        # 2. Exact alias match
         for sf, aliases in SCHEMA_ALIASES.items():
             if any(_normalize(a) == norm for a in aliases):
                 rows.append({
@@ -196,7 +251,6 @@ def suggest_schema_mapping(uploaded_df: pd.DataFrame) -> pd.DataFrame:
         if matched:
             continue
 
-        # 3. Fuzzy match
         best_score = 0.0
         best_field = "ignore"
         for sf in STANDARD_FIELDS:
@@ -238,20 +292,64 @@ def _detect_unit_conversion(col_name: str, target_field: str) -> float:
     return 1.0
 
 
+def assess_ml_eligibility(
+    mapped_df: pd.DataFrame,
+    source_type: str,
+) -> dict:
+    """Determine if an uploaded dataset is eligible for ML training."""
+    profile = SOURCE_TYPE_PROFILES.get(source_type, SOURCE_TYPE_PROFILES["unknown"])
+
+    if not profile["ml_eligible"]:
+        return {
+            "eligible": False,
+            "reason": profile["ml_condition"],
+            "usage": profile["usage"],
+        }
+
+    has_yield = (
+        "yield_strength_mpa" in mapped_df.columns
+        and mapped_df["yield_strength_mpa"].notna().sum() > 0
+    )
+    has_composition = any(c.startswith("wt_percent_") for c in mapped_df.columns)
+
+    if source_type == "experimental_test" and not (has_yield and has_composition):
+        return {
+            "eligible": False,
+            "reason": "Requires both composition (wt%) and measured yield strength columns",
+            "usage": "Decision support only until composition data is added",
+        }
+
+    if not has_yield:
+        return {
+            "eligible": False,
+            "reason": "No measured yield strength values found",
+            "usage": "Decision support only",
+        }
+
+    return {
+        "eligible": True,
+        "reason": profile["ml_condition"],
+        "usage": profile["usage"],
+    }
+
+
 def apply_schema_mapping(
     uploaded_df: pd.DataFrame,
     mapping_dict: dict[str, str],
     source_label: str = "uploaded_supplier_sheet",
+    source_type: str = "supplier_sheet",
 ) -> pd.DataFrame:
     """Apply mapping_dict {uploaded_col: standard_field} and return unified-schema DataFrame."""
+    profile = SOURCE_TYPE_PROFILES.get(source_type, SOURCE_TYPE_PROFILES["unknown"])
     out = pd.DataFrame()
     n = len(uploaded_df)
 
     out["material_id"] = [f"UPLOAD_{i:04d}" for i in range(n)]
     out["source_dataset"] = source_label
-    out["source_type"] = "supplier_sheet"
-    out["source_trust_score"] = 70
+    out["source_type"] = source_type
+    out["source_trust_score"] = profile["trust"]
     out["used_for_ml_training"] = False
+    out["engineer_reviewed"] = False
 
     for upload_col, std_field in mapping_dict.items():
         if std_field == "ignore" or std_field not in STANDARD_FIELDS:
