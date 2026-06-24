@@ -1,4 +1,8 @@
-"""Confidence and risk scoring for material property predictions."""
+"""Prediction confidence and risk scoring for MatIntel.
+
+Note: This module scores *model prediction confidence*.
+The recommender's source_trust_score_norm is a separate concept (data provenance trust).
+"""
 
 from __future__ import annotations
 import numpy as np
@@ -10,10 +14,10 @@ SOURCE_PENALTIES: dict[str, int] = {
     "experimental_test": 2,
     "computed_database": 10,
     "computed": 10,
+    "public_reference": 12,
     "supplier_sheet": 12,
     "sustainability_sheet": 18,
     "procurement_sheet": 18,
-    "public_reference": 15,
     "predicted": 20,
     "demo_enriched": 25,
     "unknown": 20,
@@ -21,13 +25,12 @@ SOURCE_PENALTIES: dict[str, int] = {
 
 
 def confidence_score(row: pd.Series, pred_info: dict, bundle: dict) -> dict:
+    """Compute prediction confidence score (0-100) with penalty breakdown."""
     pred = max(float(pred_info["prediction"]), 1.0)
     width = float(pred_info["uncertainty_width"])
 
-    # Penalty 1: Model uncertainty (wide prediction interval = less certain)
     uncertainty_penalty = min(30, (width / pred) * 100)
 
-    # Penalty 2: Missing key engineering fields
     required = ["material_family", "family", "source_type", "density_g_cm3",
                  "elongation_percent", "youngs_modulus_gpa"]
     missing_count = 0
@@ -37,11 +40,9 @@ def confidence_score(row: pd.Series, pred_info: dict, bundle: dict) -> dict:
             missing_count += 1
     missing_data_penalty = missing_count * 3
 
-    # Penalty 3: Source type reliability
     source = str(row.get("source_type", "unknown")).lower()
     source_risk_penalty = SOURCE_PENALTIES.get(source, 15)
 
-    # Penalty 4: Out-of-distribution detection via z-score
     feature_cols = bundle.get("feature_cols", [])
     mean = bundle.get("train_feature_mean", {})
     std = bundle.get("train_feature_std", {})

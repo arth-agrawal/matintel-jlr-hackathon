@@ -21,10 +21,13 @@ def _fmt(val, suffix: str = "", fallback: str = "Not available") -> str:
     return f"{val}{suffix}"
 
 
-def _is_observed(row: pd.Series) -> bool:
-    """Whether yield strength was directly observed (from experimental source)."""
+def _property_basis(row: pd.Series) -> str:
     source = str(row.get("source_type", "")).lower()
-    return source in ("experimental", "public_experimental", "experimental_test")
+    if source in ("public_experimental", "experimental", "experimental_test"):
+        return "Directly observed (experimental measurement)"
+    elif source == "computed_database":
+        return "Computed reference (DFT / simulation)"
+    return "Model-predicted or reference-only"
 
 
 def build_report(
@@ -34,6 +37,8 @@ def build_report(
     model_metrics: dict | None = None,
     n_reference_rows: int = 312,
     n_uploaded_rows: int = 0,
+    active_model_name: str = "structural_yield_strength",
+    subsystem: str = "",
 ) -> str:
     name = row.get("material_name", "Selected material")
     mid = row.get("material_id", "N/A")
@@ -41,6 +46,8 @@ def build_report(
     source = row.get("source_dataset", "N/A")
     source_type = row.get("source_type", "N/A")
     trust = _fmt(row.get("source_trust_score"), "/100")
+    subsystem_val = subsystem or row.get("application_subsystem", "N/A")
+    prop_basis = _property_basis(row)
 
     ys = _fmt(row.get("yield_strength_mpa"), " MPa")
     uts = _fmt(row.get("ultimate_tensile_strength_mpa"), " MPa")
@@ -55,69 +62,78 @@ def build_report(
     ws = _fmt(row.get("weight_saving_percent"), "%")
     reasons = row.get("reason_codes", "No reason codes available")
 
-    observed = _is_observed(row)
-    property_basis = "Directly observed (experimental measurement)" if observed else "Model-predicted (RandomForest ensemble)"
-
-    # Score breakdown table
     sub_score_fields = [
-        ("Strength", "strength_score"),
-        ("Weight Saving", "weight_saving_score"),
-        ("Stiffness", "stiffness_score"),
-        ("Confidence", "confidence_score"),
-        ("Sustainability", "sustainability_score"),
-        ("Manufacturability", "manufacturability_score"),
-        ("Cost", "cost_score"),
-        ("Supply Risk", "supply_risk_score"),
+        ("Strength", "strength_score"), ("Weight Saving", "weight_saving_score"),
+        ("Stiffness", "stiffness_score"), ("Source Trust", "source_trust_score_norm"),
+        ("Sustainability", "sustainability_score"), ("Manufacturability", "manufacturability_score"),
+        ("Cost", "cost_score"), ("Supply Risk", "supply_risk_score"),
     ]
     score_rows = ""
     for label, col in sub_score_fields:
         val = row.get(col)
         score_rows += f"| {label} | {_fmt(val, '/100')} |\n"
 
-    # Missing data flags
     missing: list[str] = []
     for field, label in [
-        ("fatigue_strength_mpa", "Fatigue strength"),
-        ("corrosion_resistance_score", "Corrosion resistance"),
-        ("hardness_hv", "Hardness"),
-        ("thermal_conductivity_w_mk", "Thermal conductivity"),
-        ("supplier_risk_score", "Supplier risk assessment"),
-        ("traceability_score", "Supply chain traceability"),
+        ("fatigue_strength_mpa", "Fatigue strength"), ("corrosion_resistance_score", "Corrosion resistance"),
+        ("hardness_hv", "Hardness"), ("thermal_conductivity_w_mk", "Thermal conductivity"),
+        ("supplier_risk_score", "Supplier risk"), ("traceability_score", "Traceability"),
     ]:
         val = row.get(field)
         if val is None or (isinstance(val, float) and np.isnan(val)):
             missing.append(f"- **{label}**: not available in source data")
-
     missing_section = "\n".join(missing) if missing else "- All key fields present."
 
-    # Model info
     model_line = ""
     if model_metrics:
         model_line = (
-            f"\n- Predictive model: RandomForest ensemble (R² = {model_metrics.get('R2', 'N/A')}, "
-            f"MAE = {model_metrics.get('MAE', 'N/A')} MPa, "
+            f"\n- Active model: **{active_model_name}** — RandomForest ensemble "
+            f"(R² = {model_metrics.get('R2', 'N/A')}, MAE = {model_metrics.get('MAE', 'N/A')} MPa, "
             f"trained on {model_metrics.get('train_rows', 'N/A')} experimental rows)"
         )
 
-    # Reason codes
-    reason_lines = "\n".join(
-        f"- {r.strip()}" for r in reasons.split("|") if r.strip()
-    )
-
-    # Uploaded sources line
     uploaded_line = ""
     if n_uploaded_rows > 0:
-        uploaded_line = f"\n- Uploaded evidence: **{n_uploaded_rows} rows** (supplier sheet, decision support only)"
+        uploaded_line = f"\n- Uploaded evidence: **{n_uploaded_rows} rows** (decision support)"
 
-    # Validation gates
-    gate_lines = "\n".join(
-        f"{i+1}. **{g['gate']}** — {g['detail']}" for i, g in enumerate(VALIDATION_GATES)
-    )
+    reason_lines = "\n".join(f"- {r.strip()}" for r in reasons.split("|") if r.strip())
+    gate_lines = "\n".join(f"{i+1}. **{g['gate']}** — {g['detail']}" for i, g in enumerate(VALIDATION_GATES))
+
+    density_flag = ""
+    if row.get("_density_variance_flag", False):
+        density_flag = (
+            "\n> Weight saving not differentiating in current source; "
+            "upload lightweight candidate evidence or computed reference data."
+        )
+
+    subsystem_section = ""
+    if subsystem:
+        try:
+            from src.subsystem_profiles import get_subsystem_readiness, SUBSYSTEM_PROFILES
+            readiness = get_subsystem_readiness(row, subsystem)
+            profile = SUBSYSTEM_PROFILES.get(subsystem, {})
+            missing_fields = ", ".join(readiness["missing"]) if readiness["missing"] else "None"
+            subsystem_section = f"""
+## Subsystem Readiness — {subsystem}
+- **Coverage:** {readiness['coverage_pct']}% ({readiness['readiness']})
+- **Scoring focus:** {profile.get('scoring_focus', '—')}
+- **Public data coverage:** {profile.get('coverage_note', '—')}
+- **Missing evidence fields:** {missing_fields}
+"""
+        except ImportError:
+            pass
+
+    model_registry_section = f"""
+## Model Registry
+- **Model used for screening:** {active_model_name}
+- **Property basis:** {prop_basis}
+- **Platform note:** Current active experimental model is trained on structural steel data. The platform is designed to scale subsystem-wise as JLR/supplier/public evidence sources are connected.
+"""
 
     return f"""# MatIntel Decision Report
 
 ## Use Case
-**{use_case}** — Alternative material screening for JLR automotive application.
+**{use_case}** — {subsystem_val} subsystem screening for JLR.
 
 ## Selected Material
 | Field | Value |
@@ -125,22 +141,20 @@ def build_report(
 | Material ID | {mid} |
 | Material Name | {name} |
 | Family | {family} |
-| Source Dataset | {source} |
+| Subsystem | {subsystem_val} |
+| Source | {source} |
 | Source Type | {source_type} |
 | Source Trust | {trust} |
-| Property Basis | {property_basis} |
+| Property Basis | {prop_basis} |
 
-## Data Sources Used
-- **Layer 1 — Public reference data:** matminer steel_strength ({n_reference_rows} experimental steel alloys, trust 95/100){uploaded_line}{model_line}
+## Data Sources
+- Public reference: matminer steel_strength ({n_reference_rows} experimental steel alloys, trust 95/100){uploaded_line}{model_line}
 
-> Public datasets bootstrap the predictive layer before private JLR data is connected.
-> Uploaded sheets are scored and mapped but not blindly ingested into ML training.
-
-## Known / Predicted Properties
+## Properties
 | Property | Value |
 |----------|-------|
 | Yield Strength | {ys} |
-| Ultimate Tensile Strength | {uts} |
+| Tensile Strength | {uts} |
 | Elongation | {elong} |
 | Density | {density} |
 | Young's Modulus | {modulus} |
@@ -149,32 +163,27 @@ def build_report(
 | Hardness | {hardness} |
 
 ## Suitability Score
-**{score}** (minimum required yield strength: {min_strength} MPa)
-
-Weight saving vs steel baseline: **{ws}**
+**{score}** (min yield: {min_strength} MPa) · Weight saving: **{ws}**
+{density_flag}
 
 ### Score Breakdown
-| Sub-Score | Value |
+| Component | Value |
 |-----------|-------|
 {score_rows}
-> Final screening score is a weighted engineering score, not a black-box ML output. \
-Weights are set per JLR use-case preset.
 
-## Why Recommended
+## Rationale
 {reason_lines}
 
-## Missing Data / Risk Flags
+## Missing Data
 {missing_section}
-
-> Fields labelled "demo enrichment" are indicative defaults, not measured values from the source dataset.
-
+{subsystem_section}
+{model_registry_section}
 ## Validation Gates
-Before engineering release, the following gates must be passed:
 {gate_lines}
 
 ## Next Action
-Prioritise **{name}** for lab validation and compare against the current steel baseline under the **{use_case}** programme.
+Prioritise **{name}** for lab validation under the **{use_case}** programme.
 
 ---
-*Generated by MatIntel — Material Intelligence Platform. Screening only; not final engineering approval.*
+*MatIntel — Screening only, not final engineering approval.*
 """

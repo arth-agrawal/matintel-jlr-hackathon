@@ -2,34 +2,32 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 import numpy as np
 import pandas as pd
 
-
-RAW_PATH = Path("data/raw/steel_strength_raw.csv")
-UNIFIED_PATH = Path("data/processed/unified_material_library.csv")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+RAW_PATH = PROJECT_ROOT / "data" / "raw" / "steel_strength_raw.csv"
+UNIFIED_PATH = PROJECT_ROOT / "data" / "processed" / "unified_material_library.csv"
 
 DEMO_ENRICHMENT_COLS = [
-    "density_g_cm3",
-    "cost_index",
-    "co2_index",
-    "co2_kg_per_kg",
-    "recycled_content_percent",
-    "recyclability_score",
-    "bio_based_content_percent",
-    "closed_loop_available",
-    "supplier_name",
-    "supplier_risk_score",
-    "traceability_score",
-    "critical_material_risk_score",
-    "certification_tags",
-    "corrosion_resistance_score",
-    "fatigue_strength_mpa",
-    "hardness_hv",
-    "thermal_conductivity_w_mk",
+    "density_g_cm3", "cost_index", "co2_index", "co2_kg_per_kg",
+    "recycled_content_percent", "recyclability_score", "bio_based_content_percent",
+    "closed_loop_available", "supplier_name", "supplier_risk_score",
+    "traceability_score", "critical_material_risk_score", "certification_tags",
+    "corrosion_resistance_score", "fatigue_strength_mpa", "hardness_hv",
     "youngs_modulus_gpa",
+]
+
+# Optional subsystem fields — NaN unless sourced from trusted datasets or uploads
+OPTIONAL_SCHEMA_COLS = [
+    "bulk_modulus_gpa", "shear_modulus_gpa", "formation_energy_per_atom", "band_gap_ev",
+    "specific_heat", "viscosity", "freezing_point", "boiling_point",
+    "impact_resistance_score", "flame_retardancy_score", "electrical_insulation_score",
+    "comfort_score", "durability_score", "voc_emission_score", "fire_safety_score",
+    "wear_resistance_score", "rolling_resistance_score", "grip_score",
+    "salt_spray_hours", "adhesion_score", "scratch_resistance_score",
+    "toxicity_score", "corrosion_inhibition_score", "thermal_conductivity_w_mk",
 ]
 
 ELEMENT_COLS = [
@@ -54,8 +52,8 @@ def load_real_steel_data() -> pd.DataFrame:
         from matminer.datasets import load_dataset
     except ImportError:
         raise RuntimeError(
-            "matminer is not installed and no local CSV found at data/raw/steel_strength_raw.csv. "
-            "Install matminer or run: python scripts/bootstrap_data.py on a machine with internet."
+            "matminer is not installed and no local CSV found. "
+            "Run: python scripts/bootstrap_data.py"
         )
 
     last_err = None
@@ -71,8 +69,7 @@ def load_real_steel_data() -> pd.DataFrame:
 
     raise RuntimeError(
         f"Could not download matminer steel dataset ({last_err}). "
-        "Run 'python scripts/bootstrap_data.py' once with internet, "
-        "or place steel_strength_raw.csv inside data/raw/."
+        "Run 'python scripts/bootstrap_data.py' once with internet."
     )
 
 
@@ -107,19 +104,18 @@ def build_unified_schema(raw: pd.DataFrame) -> pd.DataFrame:
     unified["material_name"] = df[formula_col].astype(str) if formula_col else "Steel alloy"
     unified["formula"] = unified["material_name"]
 
-    # JLR schema fields
     unified["material_family"] = "Steel"
     unified["material_subfamily"] = "High-strength steel"
-
-    # Backward compat alias
     unified["family"] = unified["material_family"]
+    unified["application_subsystem"] = "Structural / Chassis"
 
     unified["source_dataset"] = "matminer_steel_strength"
-    unified["source_type"] = "experimental"
+    unified["source_type"] = "public_experimental"
     unified["source_trust_score"] = 95
     unified["used_for_ml_training"] = True
+    unified["model_registry_eligible"] = True
 
-    # Real measured properties from matminer
+    # Real measured properties
     unified["yield_strength_mpa"] = pd.to_numeric(df[y_col], errors="coerce")
     unified["ultimate_tensile_strength_mpa"] = (
         pd.to_numeric(df[uts_col], errors="coerce") if uts_col else np.nan
@@ -128,13 +124,15 @@ def build_unified_schema(raw: pd.DataFrame) -> pd.DataFrame:
         pd.to_numeric(df[elong_col], errors="coerce") if elong_col else np.nan
     )
 
-    # Demo enrichment — not from source dataset, clearly labelled
+    # Demo enrichment — not from source dataset
     unified["density_g_cm3"] = 7.85
     unified["youngs_modulus_gpa"] = 200.0
     unified["hardness_hv"] = np.nan
     unified["fatigue_strength_mpa"] = np.nan
-    unified["thermal_conductivity_w_mk"] = 50.0
     unified["corrosion_resistance_score"] = np.nan
+
+    for col in OPTIONAL_SCHEMA_COLS:
+        unified[col] = np.nan
 
     unified["cost_index"] = 35
     unified["co2_index"] = 60
@@ -149,7 +147,6 @@ def build_unified_schema(raw: pd.DataFrame) -> pd.DataFrame:
     unified["traceability_score"] = 90
     unified["critical_material_risk_score"] = 15
     unified["certification_tags"] = ""
-
     unified["prediction_confidence_score"] = np.nan
     unified["notes"] = ""
 
@@ -158,15 +155,10 @@ def build_unified_schema(raw: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             unified[f"wt_percent_{col}"] = pd.to_numeric(df[col], errors="coerce")
 
-    # Data completeness based on key engineering fields
-    key_cols = [
-        "yield_strength_mpa", "ultimate_tensile_strength_mpa",
-        "elongation_percent", "density_g_cm3", "youngs_modulus_gpa",
-        "fatigue_strength_mpa", "corrosion_resistance_score",
-    ]
-    present_keys = [c for c in key_cols if c in unified.columns]
+    # Completeness based on real measured fields only (not demo enrichment)
+    measured_keys = ["yield_strength_mpa", "ultimate_tensile_strength_mpa", "elongation_percent"]
     unified["data_completeness_score"] = (
-        100 * (1 - unified[present_keys].isna().mean(axis=1))
+        100 * (1 - unified[measured_keys].isna().mean(axis=1))
     ).round(1)
 
     UNIFIED_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -175,12 +167,16 @@ def build_unified_schema(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_or_create_unified() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load raw + unified data, rebuilding unified if needed."""
+    """Load raw + unified data, rebuilding unified if schema is stale."""
     raw = load_real_steel_data()
-    if UNIFIED_PATH.exists():
+    needs_rebuild = not UNIFIED_PATH.exists()
+    if not needs_rebuild:
         unified = pd.read_csv(UNIFIED_PATH)
-        if "material_family" not in unified.columns:
-            unified = build_unified_schema(raw)
-    else:
+        required_cols = ["application_subsystem", "model_registry_eligible"] + OPTIONAL_SCHEMA_COLS
+        if any(c not in unified.columns for c in required_cols):
+            needs_rebuild = True
+    if needs_rebuild:
         unified = build_unified_schema(raw)
+    else:
+        unified = pd.read_csv(UNIFIED_PATH)
     return raw, unified

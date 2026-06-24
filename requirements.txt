@@ -5,3 +5,4 @@ scikit-learn
 plotly
 matminer
 joblib
+# Optional: pip install jarvis-tools  (enables JARVIS-DFT sample loader)

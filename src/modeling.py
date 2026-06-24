@@ -14,7 +14,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 
-MODEL_PATH = Path("models/yield_strength_model.pkl")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MODEL_PATH = PROJECT_ROOT / "models" / "yield_strength_model.pkl"
 
 
 def get_feature_cols(df: pd.DataFrame) -> list[str]:
