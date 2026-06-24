@@ -10,6 +10,7 @@ import pandas as pd
 
 from src.subsystem_profiles import SUBSYSTEM_PROFILES, ALL_SUBSYSTEMS, get_subsystem_readiness
 from src.model_registry import MODEL_SPECS, detect_trainable_targets
+from src.data_assumptions import is_assumption_field_series
 
 
 # ── Per-subsystem filter fields (numeric min sliders when data exists) ────────
@@ -94,21 +95,54 @@ SUBSYSTEM_DISPLAY_COLUMNS: dict[str, list[str]] = {
     ],
 }
 
+# Property-based subsystem relevance — rows can appear in multiple subsystem views
+SUBSYSTEM_PROPERTY_MATCH: dict[str, list[str]] = {
+    "Structural / Chassis": [
+        "yield_strength_mpa", "ultimate_tensile_strength_mpa", "bulk_modulus_gpa", "shear_modulus_gpa",
+    ],
+    "Battery Enclosure / Underbody": [
+        "formation_energy_per_atom", "band_gap_ev", "density_g_cm3", "thermal_conductivity_w_mk",
+    ],
+    "Electronics / Thermal Interface": [
+        "band_gap_ev", "dielectric_constant", "thermal_conductivity_w_mk", "electrical_insulation_score",
+    ],
+    "Interior / Seating / Foam": [
+        "voc_emission_score", "fire_safety_score", "comfort_score", "durability_score",
+    ],
+    "Tyres / Elastomers": ["wear_resistance_score", "rolling_resistance_score", "grip_score"],
+    "Thermal Fluids / Coolants": [
+        "thermal_conductivity_w_mk", "specific_heat", "viscosity", "freezing_point", "boiling_point",
+    ],
+    "Coatings / Corrosion Protection": [
+        "corrosion_resistance_score", "salt_spray_hours", "adhesion_score", "scratch_resistance_score",
+    ],
+    "General Material Reuse": [
+        "density_g_cm3", "formation_energy_per_atom", "band_gap_ev",
+        "bulk_modulus_gpa", "shear_modulus_gpa", "yield_strength_mpa",
+    ],
+}
+
 SUBSYSTEM_TRUSTED_SOURCES: dict[str, list[str]] = {
-    "Structural / Chassis": ["matminer_steel_strength", "engineer_upload"],
-    "Battery Enclosure / Underbody": ["matminer_steel_strength", "jarvis_dft_3d_sample", "engineer_upload"],
-    "Electronics / Thermal Interface": ["jarvis_dft_3d_sample", "engineer_upload"],
-    "Interior / Seating / Foam": ["engineer_upload"],
-    "Tyres / Elastomers": ["engineer_upload"],
-    "Thermal Fluids / Coolants": ["nasa_tpsx_reference", "engineer_upload"],
-    "Coatings / Corrosion Protection": ["nasa_tpsx_reference", "jarvis_dft_3d_sample", "engineer_upload"],
-    "General Material Reuse": ["matminer_steel_strength", "jarvis_dft_3d_sample", "engineer_upload"],
+    "Structural / Chassis": ["matminer_steel_strength", "jarvis_dft_3d", "matminer_matbench_extra", "engineer_reviewed_upload"],
+    "Battery Enclosure / Underbody": ["jarvis_dft_3d", "matminer_matbench_extra", "engineer_reviewed_upload"],
+    "Electronics / Thermal Interface": ["jarvis_dft_3d", "matminer_matbench_extra", "engineer_reviewed_upload"],
+    "Interior / Seating / Foam": ["nasa_tpsx_reference", "engineer_reviewed_upload"],
+    "Tyres / Elastomers": ["engineer_reviewed_upload"],
+    "Thermal Fluids / Coolants": ["nasa_tpsx_reference", "engineer_reviewed_upload"],
+    "Coatings / Corrosion Protection": ["nasa_tpsx_reference", "jarvis_dft_3d", "engineer_reviewed_upload"],
+    "General Material Reuse": ["matminer_steel_strength", "jarvis_dft_3d", "matminer_matbench_extra", "engineer_reviewed_upload"],
 }
 
 SOURCE_LABELS: dict[str, str] = {
     "matminer_steel_strength": "Matminer steel_strength (experimental steel)",
-    "jarvis_dft_3d_sample": "JARVIS-DFT 3D sample (computed reference)",
+    "jarvis_dft_3d": "JARVIS-DFT dft_3d (computed reference)",
+    "jarvis_dft_3d_sample": "JARVIS-DFT dft_3d (computed reference)",
+    "matminer_matbench_extra": "Matminer / Matbench property benchmarks",
+    "matbench_dielectric": "Matbench dielectric",
+    "matbench_mp_gap": "Matbench MP band gap",
+    "matbench_mp_e_form": "Matbench formation energy",
     "nasa_tpsx_reference": "NASA TPSX reference/upload pathway",
+    "engineer_reviewed_upload": "Engineer-reviewed evidence upload",
     "engineer_upload": "Engineer-reviewed evidence upload",
 }
 
@@ -131,32 +165,56 @@ def _isnan(val: Any) -> bool:
         return False
 
 
-def count_nonempty(df: pd.DataFrame, field: str) -> int:
+def count_nonempty(df: pd.DataFrame, field: str, exclude_assumptions: bool = True) -> int:
     if field not in df.columns:
         return 0
-    return int(df[field].notna().sum())
+    mask = df[field].notna()
+    if exclude_assumptions and "assumption_fields" in df.columns:
+        mask = mask & ~is_assumption_field_series(df, field)
+    return int(mask.sum())
 
 
 def field_has_data(df: pd.DataFrame, field: str, min_rows: int = 1) -> bool:
-    return count_nonempty(df, field) >= min_rows
+    return count_nonempty(df, field, exclude_assumptions=True) >= min_rows
 
 
 def field_has_variance(df: pd.DataFrame, field: str, min_std: float = 0.01) -> bool:
     if field not in df.columns:
         return False
-    series = pd.to_numeric(df[field], errors="coerce").dropna()
+    mask = df[field].notna()
+    if "assumption_fields" in df.columns:
+        mask = mask & ~is_assumption_field_series(df, field)
+    series = pd.to_numeric(df.loc[mask, field], errors="coerce").dropna()
     if len(series) < 2:
         return False
     return float(series.std()) >= min_std
 
 
 def filter_subsystem_rows(df: pd.DataFrame, subsystem: str) -> pd.DataFrame:
-    """Return rows tagged for the subsystem; General includes all rows."""
+    """Return rows relevant to subsystem by tag OR property presence."""
+    if df.empty:
+        return df.copy()
+
     if subsystem == "General Material Reuse":
         return df.copy()
-    if "application_subsystem" not in df.columns:
+
+    masks = []
+
+    if "application_subsystem" in df.columns:
+        masks.append(df["application_subsystem"] == subsystem)
+
+    prop_fields = SUBSYSTEM_PROPERTY_MATCH.get(subsystem, [])
+    for field in prop_fields:
+        if field in df.columns:
+            masks.append(df[field].notna())
+
+    if not masks:
         return df.iloc[0:0].copy()
-    return df[df["application_subsystem"] == subsystem].copy()
+
+    combined = masks[0]
+    for m in masks[1:]:
+        combined = combined | m
+    return df[combined].copy()
 
 
 def apply_subsystem_filters(
@@ -249,14 +307,26 @@ def subsystem_evidence_dashboard(
         ]
         active = sub_models[sub_models["status"] == "Active"]["model_name"].tolist()
         waiting = sub_models[sub_models["status"] == "Waiting for evidence"]["model_name"].tolist()
-        trainable = sub_models[sub_models["status"] == "Trainable"]["model_name"].tolist()
+        trainable = sub_models[sub_models["status"].isin([
+            "Trainable", "Trainable next", "Computed-reference trainable",
+        ])]["model_name"].tolist()
 
-        if active:
-            readiness = "Active"
-        elif n_materials > 0 and len(available_fields) >= len(profile["important_fields"]) * 0.4:
-            readiness = "Partial"
+        has_experimental = False
+        has_computed = False
+        if "source_type" in sub_df.columns and len(sub_df) > 0:
+            has_experimental = bool(sub_df["source_type"].isin(["public_experimental", "experimental_test"]).any())
+            has_computed = bool(sub_df["source_type"].isin(["computed_database", "public_benchmark"]).any())
+
+        if active and has_experimental:
+            readiness = "Active experimental coverage"
+        elif has_computed and n_materials > 0:
+            readiness = "Computed-reference coverage"
+        elif n_materials > 0 and len(available_fields) >= len(profile["important_fields"]) * 0.3:
+            readiness = "Benchmark/reference coverage"
+        elif n_materials > 0:
+            readiness = "Partial — validation required"
         else:
-            readiness = "Waiting for Evidence"
+            readiness = "Upload evidence needed"
 
         rows.append({
             "subsystem": subsystem,
@@ -351,8 +421,9 @@ def get_model_activation_info(model_name: str, registry_df: pd.DataFrame) -> dic
     activation = {
         "structural_yield_strength": "Already active — trained on matminer experimental steel.",
         "structural_tensile_strength": "Upload or connect experimental steel data with UTS labels.",
-        "computed_formation_energy": "Load JARVIS-DFT sample (Evidence Intake tab) for computed formation energy rows.",
-        "computed_band_gap": "Load JARVIS-DFT sample for band gap reference data.",
+        "computed_formation_energy": "Load JARVIS-DFT or matbench formation energy (Evidence Intake → broader reference set).",
+        "computed_band_gap": "Load JARVIS-DFT or matbench band gap datasets.",
+        "elastic_modulus_proxy": "Load matbench log_kvrh/log_gvrh or JARVIS modulus fields.",
         "thermal_conductivity": "Export NASA TPSX properties or upload reviewed thermal test CSV with thermal_conductivity_w_mk.",
     }
 

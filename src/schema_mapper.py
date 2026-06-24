@@ -45,7 +45,8 @@ STANDARD_FIELDS: list[str] = [
     "supplier_name", "supplier_risk_score", "traceability_score",
     "critical_material_risk_score", "certification_tags",
     "data_completeness_score", "prediction_confidence_score",
-    "model_registry_eligible", "notes",
+    "data_assumption_notes", "assumption_fields",
+    "model_registry_eligible", "recommendation_basis", "engineer_reviewed", "dielectric_constant", "notes",
 ]
 
 SOURCE_TYPE_PROFILES: dict[str, dict] = {
@@ -78,6 +79,12 @@ SOURCE_TYPE_PROFILES: dict[str, dict] = {
         "ml_condition": "Not eligible by default unless exported rows are labelled and reviewed",
         "usage": "Reference / screening only",
         "description": "Public reference databases (e.g. NASA TPSX pathway).",
+    },
+    "public_benchmark": {
+        "trust": 85, "ml_eligible": False,
+        "ml_condition": "Trainable for computed/benchmark property models when target + features exist",
+        "usage": "Benchmark reference + computed model training",
+        "description": "Matbench and other curated benchmark property datasets.",
     },
     "sustainability_sheet": {
         "trust": 65, "ml_eligible": False,
@@ -243,6 +250,8 @@ def apply_schema_mapping(
     out["source_trust_score"] = profile["trust"]
     out["used_for_ml_training"] = False
     out["model_registry_eligible"] = profile["ml_eligible"]
+    out["engineer_reviewed"] = False
+    out["recommendation_basis"] = "upload-evidence based screening"
 
     for upload_col, std_field in mapping_dict.items():
         if std_field == "ignore" or std_field not in STANDARD_FIELDS:

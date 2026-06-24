@@ -7,6 +7,7 @@ import pandas as pd
 
 from src.subsystem_profiles import SUBSYSTEM_PROFILES
 from src.evidence_coverage import filter_subsystem_rows, field_has_data, field_has_variance
+from src.data_assumptions import is_assumption_field_series
 
 
 def clamp(x: float, lo: float = 0, hi: float = 100) -> float:
@@ -167,12 +168,23 @@ def _score_from_field(df: pd.DataFrame, field: str, invert: bool = False) -> pd.
     if not field_has_variance(df, field):
         return None
     vals = _numeric_col(df, field)
-    if invert:
-        return (100 - vals).clip(0, 100).round(1)
-    mx = float(vals.max())
-    if mx <= 0:
+    assump = (
+        is_assumption_field_series(df, field)
+        if "assumption_fields" in df.columns
+        else pd.Series(False, index=df.index)
+    )
+    measured = vals[~assump]
+    if measured.dropna().empty:
         return None
-    return (vals / mx * 100).clip(0, 100).round(1)
+    if invert:
+        scored = (100 - vals).clip(0, 100).round(1)
+    else:
+        mx = float(measured.max())
+        if mx <= 0:
+            return None
+        scored = (vals / mx * 100).clip(0, 100).round(1)
+    scored.loc[assump] = 50.0
+    return scored.round(1)
 
 
 def recommend_materials(
@@ -230,9 +242,20 @@ def recommend_materials(
     if "weight_saving_score" in score_config:
         if field_has_data(df, "density_g_cm3") and not low_density_variance:
             density = _numeric_col(df, "density_g_cm3")
+            assump_density = (
+                is_assumption_field_series(df, "density_g_cm3")
+                if "assumption_fields" in df.columns
+                else pd.Series(False, index=df.index)
+            )
             df["weight_saving_percent"] = ((baseline_density - density) / baseline_density * 100).round(1)
+            df["weight_saving_percent"] = df["weight_saving_percent"].where(~assump_density, 0.0)
             df["weight_saving_score"] = df["weight_saving_percent"].apply(lambda x: clamp(x * 2)).round(1)
+            df.loc[assump_density, "weight_saving_score"] = 50.0
             used_dims.append("weight_saving_score")
+            if assump_density.any():
+                global_reasons.append(
+                    "~ Weight saving neutral for rows with engineering-default density (not measured)"
+                )
         else:
             df["weight_saving_percent"] = 0.0
             df["weight_saving_score"] = 50.0
@@ -347,8 +370,14 @@ def _reason_codes(row: pd.Series, subsystem: str, global_reasons: list[str]) -> 
     reasons = list(dict.fromkeys(global_reasons))
 
     source = str(row.get("source_type", "")).lower()
-    if source == "computed_database":
-        reasons.append("~ Computed reference only: not experimental validation")
+    basis = str(row.get("recommendation_basis", "")).lower()
+    if source == "computed_database" or "computed" in basis:
+        reasons.append("~ Computed reference coverage available — experimental validation required")
+        reasons.append("~ Property present from JARVIS/Matminer reference")
+        reasons.append("~ Not used for experimental strength model")
+    elif source == "public_benchmark" or "benchmark" in basis:
+        reasons.append("~ Property present from JARVIS/Matminer reference")
+        reasons.append("~ Benchmark/reference screening — experimental validation required")
     elif source == "supplier_sheet":
         reasons.append("~ Supplier evidence: requires engineer review before ML training")
     elif source in ("public_experimental", "experimental_test") and subsystem == "Structural / Chassis":
