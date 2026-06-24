@@ -16,7 +16,7 @@ from src.modeling import load_or_train_model, predict_with_interval
 from src.confidence import confidence_score
 from src.recommender import (
     recommend_materials, USE_CASE_PRESETS,
-    STRENGTH_MODES, compute_dynamic_threshold,
+    STRENGTH_MODES, compute_dynamic_threshold, get_scoring_dimensions,
 )
 from src.report_generator import build_report, VALIDATION_GATES
 from src.schema_mapper import (
@@ -25,7 +25,13 @@ from src.schema_mapper import (
 )
 from src.public_sources import PUBLIC_DATASET_REGISTRY, load_jarvis_dft_sample
 from src.subsystem_profiles import SUBSYSTEM_PROFILES, ALL_SUBSYSTEMS, get_subsystem_readiness
-from src.model_registry import detect_trainable_targets, get_active_models
+from src.model_registry import detect_trainable_targets, get_active_models, MODEL_SPECS
+from src.evidence_coverage import (
+    filter_subsystem_rows, apply_subsystem_filters, format_display_table,
+    property_coverage_matrix, subsystem_evidence_dashboard, empty_state_info,
+    get_available_filters, get_model_activation_info, SUBSYSTEM_CHART_FIELD,
+    SUBSYSTEM_FILTER_FIELDS, field_has_data,
+)
 
 MAX_UPLOAD_ROWS = 5_000
 
@@ -69,6 +75,11 @@ PREMIUM_CSS = """
 .src-card.active { border-left: 3px solid var(--green-light); }
 .src-card.pending { border-left: 3px solid var(--gold); }
 .src-card.empty { border-left: 3px solid var(--border-mid); opacity: 0.55; }
+.empty-state { border: 1px solid var(--border-light); border-radius: 10px; padding: 24px;
+    background: linear-gradient(180deg, var(--warm-white) 0%, white 100%); margin: 12px 0; }
+.empty-state h3 { margin: 0 0 8px; color: var(--racing-green); font-size: 1.1rem; }
+.empty-state p { margin: 4px 0; font-size: 0.85rem; color: var(--text-secondary); }
+.empty-state ul { margin: 8px 0; padding-left: 18px; font-size: 0.82rem; color: var(--text-secondary); }
 .pill { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 0.72rem;
     font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px; }
 .pill-green { background: #E8F5E9; color: #2E7D32; }
@@ -120,7 +131,7 @@ st.markdown(PREMIUM_CSS, unsafe_allow_html=True)
 def cached_data():
     return load_or_create_unified()
 
-@st.cache_resource(show_spinner="Training yield-strength model …")
+@st.cache_resource(show_spinner="Loading prediction model …")
 def cached_model(_unified):
     return load_or_train_model(_unified)
 
@@ -154,6 +165,8 @@ unified = pd.concat(parts, ignore_index=True) if len(parts) > 1 else unified_bas
 n_uploaded = len(st.session_state["uploaded_rows"])
 n_jarvis = len(st.session_state["jarvis_rows"])
 M = model_bundle["metrics"]
+MODEL_ALGO = model_bundle.get("model_name", "RandomForestRegressor")
+registry_df = detect_trainable_targets(unified)
 
 source_datasets = unified["source_dataset"].nunique() if "source_dataset" in unified.columns else 1
 ml_rows = int(
@@ -262,16 +275,88 @@ def render_quality_gate(row, subsystem: str = "Structural / Chassis"):
 
 
 def _render_source_card(key: str, info: dict, card_class: str = "active"):
+    ml_mode = info.get("ml_mode", "ML training" if info.get("used_for_ml_training") else "reference screening")
+    targets = ", ".join(info.get("trainable_targets", [])[:3])
     st.markdown(
         f"""<div class="src-card {card_class}">
         <h4>{esc(info['name'])}</h4>
         <table>
+        <tr><td>Domain</td><td>{esc(info['application_subsystem'])}</td></tr>
         <tr><td>Source Type</td><td>{esc(info['source_type'])}</td></tr>
-        <tr><td>Subsystem</td><td>{esc(info['application_subsystem'])}</td></tr>
-        <tr><td>Trust Score</td><td>{info['trust_score']} / 100</td></tr>
-        <tr><td>ML Training</td><td>{'Yes' if info['used_for_ml_training'] else 'No (reference)'}</td></tr>
+        <tr><td>Trust</td><td>{info['trust_score']} / 100</td></tr>
+        <tr><td>Mode</td><td>{esc(str(ml_mode))}</td></tr>
+        <tr><td>Targets</td><td>{esc(targets)}</td></tr>
         <tr><td>Status</td><td>{esc(info.get('status', 'optional'))}</td></tr>
         </table></div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_empty_state(subsystem: str):
+    info = empty_state_info(subsystem, unified, registry_df)
+    sources_html = "".join(f"<li>{esc(s)}</li>" for s in info["trusted_sources"])
+    fields_html = "".join(f"<li>{esc(f.replace('_', ' '))}</li>" for f in info["expected_fields"][:8])
+    registry_html = "".join(
+        f"<li><strong>{esc(r['model_name'])}</strong> — {esc(r['status'])}</li>"
+        for r in info.get("registry_rows", [])[:4]
+    )
+    st.markdown(
+        f"""<div class="empty-state">
+        <h3>Waiting for subsystem evidence</h3>
+        <p><strong>{esc(subsystem)}</strong></p>
+        <p>{esc(info['activation_hint'])}</p>
+        <p><strong>Trusted sources that can activate this subsystem:</strong></p>
+        <ul>{sources_html}</ul>
+        <p><strong>Expected fields:</strong></p>
+        <ul>{fields_html}</ul>
+        <p><strong>Model registry:</strong></p>
+        <ul>{registry_html or '<li>No models registered yet</li>'}</ul>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+    st.info("Upload engineer-reviewed evidence in the Evidence Intake tab, or load optional public reference datasets.")
+
+
+def render_passport_for_subsystem(row, subsystem: str):
+    """Property-aware passport sections for selected subsystem."""
+    profile = SUBSYSTEM_PROFILES.get(subsystem, {})
+    fields = profile.get("important_fields", [])
+    status_text, status_class = _decision_status(row)
+    ml_flag = str(row.get("used_for_ml_training", False)).lower() in ("true", "1")
+    source_type = str(row.get("source_type", ""))
+
+    st.markdown(f"""<div class="passport">
+    <div class="passport-header">Identity & Provenance</div>
+    <table>
+    <tr><td>Material</td><td>{_fv(row.get('material_name'))}</td></tr>
+    <tr><td>Subsystem</td><td>{esc(subsystem)}</td></tr>
+    <tr><td>Source</td><td>{_fv(row.get('source_dataset'))}</td></tr>
+    <tr><td>Source Type</td><td>{_fv(source_type)}</td></tr>
+    <tr><td>Source Trust</td><td>{_fv(row.get('source_trust_score'), '/100')}</td></tr>
+    <tr><td>ML Eligible</td><td>{'Yes' if ml_flag else 'No'}</td></tr>
+    </table></div>""", unsafe_allow_html=True)
+
+    perf_rows = ""
+    for field in fields:
+        label = field.replace("_", " ").title()
+        val = row.get(field)
+        ok = val is not None and not (isinstance(val, float) and np.isnan(val))
+        display = _fv(val) if ok else '<span class="pill pill-amber">Validation needed</span>'
+        perf_rows += f"<tr><td>{esc(label)}</td><td>{display}</td></tr>"
+
+    st.markdown(
+        f"""<div class="passport">
+        <div class="passport-header">Subsystem Properties — {esc(subsystem)}</div>
+        <table>{perf_rows}</table></div>""",
+        unsafe_allow_html=True,
+    )
+
+    if source_type == "computed_database":
+        st.caption("Computed reference only — not experimental validation.")
+
+    st.markdown(
+        f"""<div class="passport"><div class="passport-header">Decision Status</div>
+        <p style="margin:4px 0;"><span class="pill {status_class}">{status_text}</span></p></div>""",
         unsafe_allow_html=True,
     )
 
@@ -292,7 +377,7 @@ with st.sidebar:
     st.divider()
     st.markdown(f"**Sources:** {source_datasets}  \n**Materials:** {len(unified)}  \n**ML rows:** {ml_rows}")
     st.divider()
-    st.markdown(f"**Model:** RF ensemble  \nR² **{M['R2']}** · MAE **{M['MAE']}** MPa")
+    st.markdown(f"**Best model:** {MODEL_ALGO}  \nR² **{M['R2']}** · MAE **{M['MAE']}** MPa")
     st.divider()
     st.caption("Screening only. Not final engineering approval.")
 
@@ -301,7 +386,7 @@ with st.sidebar:
 st.markdown("""<div class="hero-block">
 <h1>MatIntel</h1>
 <p class="subtitle">Governed Material Intelligence for JLR Engineering</p>
-<p class="tagline">Unify fragmented material evidence, predict properties with uncertainty, and recommend what to validate next. Current active experimental model is trained on structural steel data — the platform scales subsystem-wise as evidence sources are connected.</p>
+<p class="tagline">MatIntel is property-aware, not one-score-fits-all. Structural materials are evaluated on strength/stiffness/fatigue/corrosion; electronics on thermal/electrical properties; interiors on VOC/fire/circularity; fluids on thermal/viscosity/toxicity. The model registry activates models only where eligible evidence exists.</p>
 </div>""", unsafe_allow_html=True)
 
 st.markdown(f"""<div class="metric-strip">
@@ -330,15 +415,34 @@ with tab1:
         "Each source enters with domain, trust, and model eligibility."
     )
 
-    reg_cols = st.columns(3)
-    for idx, (key, info) in enumerate(PUBLIC_DATASET_REGISTRY.items()):
-        with reg_cols[idx % 3]:
+    reg_cols = st.columns(2)
+    reg_items = list(PUBLIC_DATASET_REGISTRY.items())
+    for idx, (key, info) in enumerate(reg_items):
+        with reg_cols[idx % 2]:
             if key == "matminer_steel_strength":
-                _render_source_card(key, {**info, "status": f"loaded ({len(unified_base)} rows)"}, "active")
+                _render_source_card(key, {**info, "status": f"active — {len(unified_base)} rows loaded"}, "active")
             elif key == "jarvis_dft_3d_sample" and n_jarvis > 0:
-                _render_source_card(key, {**info, "status": f"loaded ({n_jarvis} rows)"}, "pending")
+                _render_source_card(key, {**info, "status": f"loaded — {n_jarvis} reference rows"}, "pending")
+            elif key == "engineer_upload" and n_uploaded > 0:
+                _render_source_card(key, {**info, "status": f"active — {n_uploaded} uploaded rows"}, "pending")
             else:
-                _render_source_card(key, info, "empty")
+                card = "empty" if key not in ("matminer_steel_strength",) else "active"
+                _render_source_card(key, info, card)
+
+    st.markdown('<div class="sec-header">Evidence Coverage by Subsystem</div>', unsafe_allow_html=True)
+    coverage_dash = subsystem_evidence_dashboard(unified, registry_df)
+    st.dataframe(
+        coverage_dash[[
+            "subsystem", "materials", "fields_available", "fields_missing",
+            "active_models", "waiting_models", "readiness",
+        ]],
+        use_container_width=True, hide_index=True,
+    )
+
+    with st.expander("Property Coverage Matrix"):
+        matrix = property_coverage_matrix(unified)
+        st.dataframe(matrix, use_container_width=True)
+        st.caption("Cell values = count of non-null property values for materials tagged to that subsystem.")
 
     # JARVIS loader
     if n_jarvis == 0:
@@ -445,63 +549,88 @@ with tab1:
 
 with tab2:
     st.markdown('<div class="sec-header">Material Passport Library</div>', unsafe_allow_html=True)
+    st.caption("Select a subsystem first — filters and columns adapt to relevant properties.")
 
-    fl1, fl2, fl3 = st.columns([2, 1, 1])
-    with fl1:
-        max_ys = int(unified["yield_strength_mpa"].max()) if not unified["yield_strength_mpa"].isna().all() else 3000
-        min_yield = st.slider("Min yield strength (MPa)", 0, max_ys, 0, key="lib_slider")
-    with fl2:
-        subsystem_filter = st.selectbox("Filter by subsystem", ["All"] + ALL_SUBSYSTEMS, key="lib_subsystem")
+    subsystem_filter = st.selectbox(
+        "Application subsystem", ALL_SUBSYSTEMS,
+        index=ALL_SUBSYSTEMS.index("Structural / Chassis"), key="lib_subsystem",
+    )
 
-    filtered = unified[unified["yield_strength_mpa"].fillna(0) >= min_yield].copy()
-    if subsystem_filter != "All" and "application_subsystem" in filtered.columns:
-        filtered = filtered[filtered["application_subsystem"] == subsystem_filter]
+    with st.expander("Evidence coverage for selected subsystem"):
+        dash_row = subsystem_evidence_dashboard(unified, registry_df)
+        row = dash_row[dash_row["subsystem"] == subsystem_filter]
+        if not row.empty:
+            st.dataframe(row, use_container_width=True, hide_index=True)
 
-    lib_cols = [
-        "material_id", "material_name", "material_family", "application_subsystem",
-        "yield_strength_mpa", "density_g_cm3", "youngs_modulus_gpa",
-        "source_type", "source_trust_score", "data_completeness_score",
-    ]
-    available_lib = [c for c in lib_cols if c in filtered.columns]
-    st.dataframe(filtered[available_lib].head(200), use_container_width=True, hide_index=True)
+    sub_df = filter_subsystem_rows(unified, subsystem_filter)
+    with_sliders, missing_filter_fields = get_available_filters(sub_df, subsystem_filter)
 
-    st.markdown('<div class="sec-header">Material Passport</div>', unsafe_allow_html=True)
-    if not filtered.empty:
+    min_filters: dict[str, float] = {}
+    if with_sliders:
+        st.markdown("**Property filters** (only fields with evidence)")
+        n_cols = min(3, len(with_sliders))
+        filter_cols = st.columns(n_cols)
+        for i, field in enumerate(with_sliders):
+            label = field.replace("_", " ").title()
+            col_data = pd.to_numeric(sub_df[field], errors="coerce").dropna()
+            with filter_cols[i % n_cols]:
+                if not col_data.empty:
+                    min_val = float(col_data.min())
+                    max_val = float(col_data.max())
+                    if max_val <= min_val:
+                        st.caption(f"{label}: {min_val:.2g} (flat — no filter)")
+                        min_filters[field] = min_val
+                    else:
+                        min_filters[field] = st.slider(
+                            label, min_val, max_val, min_val, key=f"filter_{subsystem_filter}_{field}",
+                        )
+
+    if missing_filter_fields:
+        with st.expander("Missing evidence / validation needed"):
+            for f in missing_filter_fields:
+                st.caption(f"• {f.replace('_', ' ')} — no labelled data in current evidence")
+
+    filtered = apply_subsystem_filters(sub_df, subsystem_filter, min_filters)
+
+    if filtered.empty:
+        render_empty_state(subsystem_filter)
+    else:
+        display_df = format_display_table(filtered, subsystem_filter)
+        st.dataframe(display_df.head(200), use_container_width=True, hide_index=True)
+
+        st.markdown('<div class="sec-header">Material Passport</div>', unsafe_allow_html=True)
         passport_id = st.selectbox("Select material", filtered["material_id"].tolist(), key="passport_select")
         if passport_id:
             p_row = filtered[filtered["material_id"] == passport_id].iloc[0]
             p1, p2 = st.columns(2)
             with p1:
-                render_material_passport(p_row)
-                p_subsystem = str(p_row.get("application_subsystem", "Structural / Chassis"))
-                readiness = get_subsystem_readiness(p_row, p_subsystem)
+                render_passport_for_subsystem(p_row, subsystem_filter)
+                readiness = get_subsystem_readiness(p_row, subsystem_filter)
                 st.markdown(f"""<div class="passport">
-                <div class="passport-header">Subsystem Readiness — {esc(p_subsystem)}</div>
+                <div class="passport-header">Subsystem Readiness</div>
                 <table>
                 <tr><td>Coverage</td><td>{readiness['coverage_pct']}%</td></tr>
                 <tr><td>Status</td><td>{esc(readiness['readiness'])}</td></tr>
                 <tr><td>Available</td><td>{len(readiness['available'])} fields</td></tr>
                 <tr><td>Missing</td><td>{len(readiness['missing'])} fields</td></tr>
                 </table></div>""", unsafe_allow_html=True)
-                if readiness["missing"]:
-                    with st.expander("Missing fields"):
-                        for f in readiness["missing"]:
-                            st.caption(f"• {f}")
             with p2:
-                if not filtered["yield_strength_mpa"].isna().all():
+                chart_field = SUBSYSTEM_CHART_FIELD.get(subsystem_filter)
+                if chart_field and field_has_data(filtered, chart_field):
                     fig = px.histogram(
-                        filtered.dropna(subset=["yield_strength_mpa"]),
-                        x="yield_strength_mpa", nbins=30,
-                        labels={"yield_strength_mpa": "Yield Strength (MPa)"},
+                        filtered.dropna(subset=[chart_field]),
+                        x=chart_field, nbins=30,
+                        labels={chart_field: chart_field.replace("_", " ").title()},
                     )
                     fig.update_layout(
                         bargap=0.05, height=400, margin=dict(l=20, r=20, t=30, b=20),
-                        title_text="Yield Strength Distribution", title_font_size=13,
+                        title_text=f"{chart_field.replace('_', ' ').title()} Distribution",
+                        title_font_size=13,
                         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                     )
                     st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No materials match the current filters.")
+                else:
+                    st.info(f"No chartable data for {chart_field or 'primary property'} in this subsystem yet.")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -510,92 +639,127 @@ with tab2:
 
 with tab3:
     st.markdown('<div class="sec-header">Model Registry</div>', unsafe_allow_html=True)
-    registry_df = detect_trainable_targets(unified)
+
+    active_df = registry_df[registry_df["status"] == "Active"]
+    trainable_df = registry_df[registry_df["status"] == "Trainable"]
+    waiting_df = registry_df[registry_df["status"].isin(["Waiting for evidence", "Insufficient data"])]
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Active", len(active_df))
+    m2.metric("Trainable", len(trainable_df))
+    m3.metric("Waiting", len(waiting_df))
+
     st.dataframe(
         registry_df[["model_name", "subsystem", "target", "eligible_rows", "status", "reason"]],
         use_container_width=True, hide_index=True,
     )
+
+    model_options = list(MODEL_SPECS.keys())
+    status_map = dict(zip(registry_df["model_name"], registry_df["status"]))
+    model_labels = [f"{m} — {status_map.get(m, 'Unknown')}" for m in model_options]
+    selected_model_idx = st.selectbox("Select model", range(len(model_options)),
+                                        format_func=lambda i: model_labels[i], key="pred_model_select")
+    selected_model = model_options[selected_model_idx]
+    model_status = status_map.get(selected_model, "Unknown")
+    activation = get_model_activation_info(selected_model, registry_df)
+
     st.caption(
         "Current active experimental model is trained on structural steel data. "
-        "The platform is designed to scale subsystem-wise as JLR/supplier/public evidence "
-        "sources are connected. JARVIS/NASA/user sources broaden reference coverage, while "
-        "only eligible labelled sources train models."
+        "Waiting models need eligible labelled evidence — not errors."
     )
 
-    st.markdown('<div class="sec-header">Yield Strength Prediction</div>', unsafe_allow_html=True)
-    st.caption(f"Random Forest ensemble · R² {M['R2']} · MAE {M['MAE']} MPa · {M['train_rows']} training rows")
-
-    pred_candidates = unified[unified["yield_strength_mpa"].notna()]["material_id"].tolist()
-    if not pred_candidates:
-        st.warning("No materials with yield strength data available for prediction.")
-    else:
-        material_id = st.selectbox("Select material", pred_candidates, key="pred_material")
-        row = unified[unified["material_id"] == material_id].iloc[0]
-
-        comp_cols = [c for c in row.index if c.startswith("wt_percent_") and pd.notna(row[c])]
-        if comp_cols:
-            with st.expander("Composition (wt%)", expanded=True):
-                comp_data = {c.replace("wt_percent_", "").upper(): round(row[c], 3) for c in comp_cols}
-                st.dataframe(pd.DataFrame([comp_data]), use_container_width=True, hide_index=True)
-
-        pred_info = predict_with_interval(model_bundle, row)
-        conf = confidence_score(row, pred_info, model_bundle)
-
-        pm1, pm2, pm3, pm4 = st.columns(4)
-        pm1.metric("Predicted", f"{pred_info['prediction']} MPa")
-        if pred_info["actual"] is not None:
-            delta = round(pred_info["prediction"] - pred_info["actual"], 1)
-            pm2.metric("Actual", f"{pred_info['actual']} MPa", delta=f"{delta:+} error")
-        else:
-            pm2.metric("Actual", "—")
-        pm3.metric("Prediction Confidence", f"{conf['confidence']}%")
-        pm4.metric("Risk", conf["risk"])
-
-        fig_iv = go.Figure()
-        fig_iv.add_trace(go.Bar(
-            x=[""], y=[pred_info["upper"] - pred_info["lower"]],
-            base=[pred_info["lower"]],
-            name="80% interval", marker_color="rgba(27,67,50,0.15)", width=0.3,
-        ))
-        fig_iv.add_trace(go.Scatter(
-            x=[""], y=[pred_info["prediction"]],
-            mode="markers", marker=dict(size=14, color="#1B4332"), name="Predicted",
-        ))
-        if pred_info["actual"] is not None:
-            fig_iv.add_trace(go.Scatter(
-                x=[""], y=[pred_info["actual"]],
-                mode="markers", marker=dict(size=12, color="#B08D57", symbol="diamond"), name="Actual",
-            ))
-        fig_iv.update_layout(
-            yaxis_title="Yield Strength (MPa)", height=260,
-            showlegend=True, margin=dict(l=40, r=40, t=20, b=20),
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="h", y=-0.15),
+    if model_status == "Active" and selected_model == "structural_yield_strength":
+        st.markdown('<div class="sec-header">Property Prediction — Yield Strength</div>', unsafe_allow_html=True)
+        interval_label = model_bundle.get("interval_method", "tree_spread")
+        st.caption(
+            f"Best selected model: **{MODEL_ALGO}** · R² {M['R2']} · MAE {M['MAE']} MPa · "
+            f"{M['train_rows']} training rows · Interval: {interval_label}"
         )
-        st.plotly_chart(fig_iv, use_container_width=True)
 
-        st.markdown('<div class="sec-header">Confidence Breakdown</div>', unsafe_allow_html=True)
-        penalties = [
-            ("Uncertainty", conf["uncertainty_penalty"], 30),
-            ("Missing Data", conf["missing_data_penalty"], 18),
-            ("Source Trust", conf["source_risk_penalty"], 25),
-            ("Out-of-Distribution", conf["out_of_distribution_penalty"], 25),
-        ]
-        for label, val, mx in penalties:
-            pct = min(val / max(mx, 1), 1.0)
-            st.progress(pct, text=f"{label}:  −{val} pts")
+        pred_candidates = unified[unified["yield_strength_mpa"].notna()]["material_id"].tolist()
+        if not pred_candidates:
+            st.warning("No materials with yield strength data available for prediction.")
+        else:
+            material_id = st.selectbox("Select material", pred_candidates, key="pred_material")
+            row = unified[unified["material_id"] == material_id].iloc[0]
 
-        with st.expander("Material Passport"):
-            render_material_passport(row, pred_info, conf)
+            comp_cols = [c for c in row.index if c.startswith("wt_percent_") and pd.notna(row[c])]
+            if comp_cols:
+                with st.expander("Composition (wt%)", expanded=True):
+                    comp_data = {c.replace("wt_percent_", "").upper(): round(row[c], 3) for c in comp_cols}
+                    st.dataframe(pd.DataFrame([comp_data]), use_container_width=True, hide_index=True)
 
-        with st.expander("Model and uncertainty method"):
-            st.markdown(
-                "- **250-tree Random Forest** trained on matminer experimental steel compositions.\n"
-                "- **Point estimate**: mean prediction across all trees.\n"
-                "- **Uncertainty interval**: 10th–90th percentile of individual tree predictions.\n"
-                "- **Confidence** starts at 100% and is reduced by: model uncertainty, "
-                "missing fields, source trust, and out-of-distribution risk."
+            pred_info = predict_with_interval(model_bundle, row)
+            conf = confidence_score(row, pred_info, model_bundle)
+
+            pm1, pm2, pm3, pm4 = st.columns(4)
+            pm1.metric("Predicted", f"{pred_info['prediction']} MPa")
+            if pred_info["actual"] is not None:
+                delta = round(pred_info["prediction"] - pred_info["actual"], 1)
+                pm2.metric("Actual", f"{pred_info['actual']} MPa", delta=f"{delta:+} error")
+            else:
+                pm2.metric("Actual", "—")
+            pm3.metric("Prediction Confidence", f"{conf['confidence']}%")
+            pm4.metric("Risk", conf["risk"])
+
+            fig_iv = go.Figure()
+            fig_iv.add_trace(go.Bar(
+                x=[""], y=[pred_info["upper"] - pred_info["lower"]],
+                base=[pred_info["lower"]],
+                name="80% interval", marker_color="rgba(27,67,50,0.15)", width=0.3,
+            ))
+            fig_iv.add_trace(go.Scatter(
+                x=[""], y=[pred_info["prediction"]],
+                mode="markers", marker=dict(size=14, color="#1B4332"), name="Predicted",
+            ))
+            if pred_info["actual"] is not None:
+                fig_iv.add_trace(go.Scatter(
+                    x=[""], y=[pred_info["actual"]],
+                    mode="markers", marker=dict(size=12, color="#B08D57", symbol="diamond"), name="Actual",
+                ))
+            fig_iv.update_layout(
+                yaxis_title="Yield Strength (MPa)", height=260,
+                showlegend=True, margin=dict(l=40, r=40, t=20, b=20),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                legend=dict(orientation="h", y=-0.15),
             )
+            st.plotly_chart(fig_iv, use_container_width=True)
+
+            st.markdown('<div class="sec-header">Confidence Breakdown</div>', unsafe_allow_html=True)
+            for label, val, mx in [
+                ("Uncertainty", conf["uncertainty_penalty"], 30),
+                ("Missing Data", conf["missing_data_penalty"], 18),
+                ("Source Trust", conf["source_risk_penalty"], 25),
+                ("Out-of-Distribution", conf["out_of_distribution_penalty"], 25),
+            ]:
+                st.progress(min(val / max(mx, 1), 1.0), text=f"{label}: −{val} pts")
+
+            with st.expander("Material Passport"):
+                render_passport_for_subsystem(row, "Structural / Chassis")
+
+            with st.expander("Model and uncertainty method"):
+                st.markdown(
+                    f"- **Best selected model:** {MODEL_ALGO} (chosen by lowest test RMSE)\n"
+                    f"- **Interval method:** {pred_info.get('interval_method', interval_label)}\n"
+                    "- **Prediction confidence** (`prediction_confidence_score`) starts at 100% "
+                    "and is reduced by uncertainty, missing fields, source trust, and OOD risk.\n"
+                    "- Source trust uses `source_trust_score` separately from prediction confidence."
+                )
+    else:
+        st.markdown('<div class="sec-header">Waiting for Eligible Evidence</div>', unsafe_allow_html=True)
+        st.markdown(
+            f"""<div class="empty-state">
+            <h3>{esc(selected_model)} — {esc(model_status)}</h3>
+            <p><strong>Target property:</strong> {esc(activation['target'])}</p>
+            <p><strong>Subsystem:</strong> {esc(activation['subsystem'])}</p>
+            <p><strong>Required features:</strong> {esc(activation['required_features'])}</p>
+            <p><strong>Eligible source types:</strong> {esc(activation['eligible_source_types'])}</p>
+            <p><strong>Current eligible rows:</strong> {activation['eligible_rows']}</p>
+            <p><strong>Why not active:</strong> {esc(activation['reason'])}</p>
+            <p><strong>How to activate:</strong> {esc(activation['how_to_activate'])}</p>
+            </div>""",
+            unsafe_allow_html=True,
+        )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -604,111 +768,99 @@ with tab3:
 
 with tab4:
     st.markdown('<div class="sec-header">JLR Fit Scoring</div>', unsafe_allow_html=True)
-    st.caption("Weighted engineering score, not a black-box ML output.")
+    st.caption("Property-aware weighted score — only dimensions with evidence for the selected subsystem.")
 
-    r1, r2, r3, r4 = st.columns(4)
+    r1, r2, r3 = st.columns(3)
     with r1:
-        use_case = st.selectbox("Use case", list(USE_CASE_PRESETS.keys()), key="rec_usecase")
+        use_case = st.selectbox("Use case preset", list(USE_CASE_PRESETS.keys()), key="rec_usecase")
     with r2:
-        strength_mode = st.selectbox("Strength target", list(STRENGTH_MODES.keys()), index=1, key="rec_mode")
+        sel_subsystem = st.selectbox(
+            "Subsystem context", ALL_SUBSYSTEMS,
+            index=ALL_SUBSYSTEMS.index(USE_CASE_PRESETS[use_case]["subsystem"]),
+            key="rec_subsystem",
+        )
     with r3:
-        baseline_density = st.number_input("Baseline density", value=7.85, min_value=0.1, key="rec_density")
-    with r4:
-        min_trust = st.number_input("Min trust", value=0, min_value=0, max_value=100, key="rec_trust")
+        min_trust = st.number_input("Min source_trust_score", value=0, min_value=0, max_value=100, key="rec_trust")
 
-    # Dynamic threshold
-    candidates_ys = unified["yield_strength_mpa"].dropna()
-    if strength_mode == "Custom":
-        min_strength = st.number_input("Custom min yield (MPa)", value=250, min_value=0, key="rec_custom_str")
-    else:
-        min_strength = compute_dynamic_threshold(candidates_ys, strength_mode)
-    st.caption(f"Dynamic yield threshold: **{min_strength} MPa** ({strength_mode})")
+    sub_profile = SUBSYSTEM_PROFILES.get(sel_subsystem, {})
+    st.caption(f"**Scoring focus:** {sub_profile.get('scoring_focus', '—')}")
+    st.caption(f"**Coverage:** {sub_profile.get('coverage_note', '—')}")
 
-    # Subsystem selector
-    use_case_subsystem = USE_CASE_PRESETS.get(use_case, {}).get("subsystem", "Structural / Chassis")
-    sel_subsystem = st.selectbox("Subsystem context", ALL_SUBSYSTEMS,
-                                  index=ALL_SUBSYSTEMS.index(use_case_subsystem) if use_case_subsystem in ALL_SUBSYSTEMS else 0,
-                                  key="rec_subsystem")
+    min_strength = 0.0
+    baseline_density = 7.85
+    if sel_subsystem in ("Structural / Chassis", "General Material Reuse"):
+        sr1, sr2, sr3 = st.columns(3)
+        with sr1:
+            strength_mode = st.selectbox("Strength target", list(STRENGTH_MODES.keys()), index=1, key="rec_mode")
+        with sr2:
+            baseline_density = st.number_input("Baseline density", value=7.85, min_value=0.1, key="rec_density")
+        with sr3:
+            sub_df_sc = filter_subsystem_rows(unified, sel_subsystem)
+            candidates_ys = sub_df_sc["yield_strength_mpa"].dropna() if "yield_strength_mpa" in sub_df_sc.columns else pd.Series(dtype=float)
+            if strength_mode == "Custom":
+                min_strength = st.number_input("Custom min yield (MPa)", value=250, min_value=0, key="rec_custom_str")
+            elif not candidates_ys.empty:
+                min_strength = compute_dynamic_threshold(candidates_ys, strength_mode)
+                st.caption(f"Dynamic threshold: **{min_strength} MPa** ({strength_mode})")
+            else:
+                st.caption("No yield strength evidence — strength scoring neutral.")
 
-    ranked = recommend_materials(unified, min_strength=min_strength, baseline_density=baseline_density,
-                                 use_case=use_case, min_trust=min_trust)
+    ranked = recommend_materials(
+        unified, subsystem=sel_subsystem, min_strength=min_strength,
+        baseline_density=baseline_density, use_case=use_case, min_trust=min_trust,
+    )
 
     if ranked.empty:
-        st.warning("No materials match the current filters.")
+        render_empty_state(sel_subsystem)
     else:
-        # Data quality gate
         st.markdown('<div class="sec-header">Data Quality Gate — Top Candidate</div>', unsafe_allow_html=True)
         top_row = ranked.iloc[0]
         gq1, gq2 = st.columns([1, 2])
         with gq1:
             render_quality_gate(top_row, sel_subsystem)
         with gq2:
-            sub_profile = SUBSYSTEM_PROFILES.get(sel_subsystem, {})
-            st.caption(f"**Scoring focus:** {sub_profile.get('scoring_focus', '—')}")
-            st.caption(f"**Coverage:** {sub_profile.get('coverage_note', '—')}")
-            with st.expander("Scoring logic"):
-                weights = USE_CASE_PRESETS.get(use_case, {}).get("weights", {})
+            with st.expander("Scoring dimensions for this subsystem"):
+                dims = get_scoring_dimensions(sel_subsystem)
                 w_df = pd.DataFrame([
-                    {"Component": k.replace("_", " ").title(), "Weight": f"{v:.0%}"}
-                    for k, v in weights.items()
+                    {"Dimension": label, "Weight": f"{w:.0%}", "Column": key}
+                    for key, label, w in dims
                 ])
                 st.dataframe(w_df, use_container_width=True, hide_index=True)
+            st.caption(f"**Used:** {top_row.get('_score_dims_used', '—')}")
+            st.caption(f"**Neutral (missing/flat):** {top_row.get('_score_dims_neutral', '—')}")
 
-        # Density variance warning
         if ranked.iloc[0].get("_density_variance_flag", False):
             st.info(
-                "Weight saving not differentiating in current source; "
-                "upload lightweight candidate evidence or computed reference data."
+                "Weight saving neutral: flat density in current evidence; "
+                "upload lightweight candidate evidence for aluminium/magnesium/composite comparison."
             )
 
-        # Top 3 cards
         st.markdown('<div class="sec-header">Top Candidates</div>', unsafe_allow_html=True)
         top3 = ranked.head(3)
         card_cols = st.columns(3)
-
-        sub_score_cols = [
-            ("Strength", "strength_score"), ("Weight Saving", "weight_saving_score"),
-            ("Stiffness", "stiffness_score"), ("Source Trust", "source_trust_score_norm"),
-            ("Sustainability", "sustainability_score"), ("Mfg", "manufacturability_score"),
-            ("Cost", "cost_score"), ("Supply Risk", "supply_risk_score"),
-        ]
+        sub_score_cols = get_scoring_dimensions(sel_subsystem)
 
         for idx, (card_col, (_, mat)) in enumerate(zip(card_cols, top3.iterrows())):
             with card_col:
                 rank_labels = ["1st", "2nd", "3rd"]
-                rank_class = f"rank-{idx+1}"
                 mat_name = esc(str(mat.get("material_name", "N/A"))[:30])
                 status_text, status_class = _decision_status(mat)
                 score_val = mat.get("suitability_score", 0)
 
-                missing_items = []
-                for field, label in [
-                    ("fatigue_strength_mpa", "Fatigue"),
-                    ("corrosion_resistance_score", "Corrosion"),
-                    ("hardness_hv", "Hardness"),
-                ]:
-                    v = mat.get(field)
-                    if v is None or (isinstance(v, float) and np.isnan(v)):
-                        missing_items.append(label)
-                missing_str = ", ".join(missing_items) if missing_items else "None"
-
                 st.markdown(
-                    f"""<div class="rec-card {rank_class}">
+                    f"""<div class="rec-card rank-{idx+1}">
                     <p class="rec-rank">{rank_labels[idx]} Candidate</p>
                     <p class="rec-name">{mat_name}</p>
                     <p class="rec-score">{score_val}</p>
                     <p class="rec-score-label">Screening Score / 100</p>
                     <p style="margin:4px 0;"><span class="pill {status_class}">{status_text}</span></p>
-                    <p class="rec-meta"><strong>Yield:</strong> {_fv(mat.get('yield_strength_mpa'), ' MPa')}</p>
-                    <p class="rec-meta"><strong>Density:</strong> {_fv(mat.get('density_g_cm3'), ' g/cm³')}</p>
+                    <p class="rec-meta"><strong>Subsystem:</strong> {esc(sel_subsystem)}</p>
                     <p class="rec-meta"><strong>Source:</strong> {esc(str(mat.get('source_type', '—')))} · Trust {_fv(mat.get('source_trust_score'))}</p>
-                    <p class="rec-meta"><strong>Missing:</strong> {esc(missing_str)}</p>
                     </div>""",
                     unsafe_allow_html=True,
                 )
 
-                reasons = str(mat.get("reason_codes", ""))
-                for r_code in reasons.split("|"):
+                for r_code in str(mat.get("reason_codes", "")).split("|"):
                     r_code = r_code.strip()
                     if r_code.startswith("+"):
                         st.success(r_code, icon="✅")
@@ -718,29 +870,27 @@ with tab4:
                         st.info(r_code)
 
                 with st.expander("Sub-scores"):
-                    for label, col in sub_score_cols:
+                    for label, col, _w in sub_score_cols:
                         val = mat.get(col, 50)
                         if isinstance(val, float) and np.isnan(val):
                             val = 50
                         st.progress(min(val / 100, 1.0), text=f"{label}: {round(val, 1)}")
 
         with st.expander("Full ranking table"):
-            rank_cols = [
-                "material_id", "material_name", "yield_strength_mpa", "density_g_cm3",
-                "weight_saving_percent", "source_trust_score", "suitability_score",
-            ]
+            rank_cols = ["material_id", "material_name", "source_type", "source_trust_score", "suitability_score"]
+            rank_cols += [c for c, _, _ in sub_score_cols if c in ranked.columns]
             available_rank = [c for c in rank_cols if c in ranked.columns]
             st.dataframe(ranked[available_rank].head(30), use_container_width=True, hide_index=True)
 
         fig = px.bar(
             ranked.head(10), x="material_id", y="suitability_score",
-            hover_data=["yield_strength_mpa", "weight_saving_percent"],
+            hover_data=["source_trust_score"],
             labels={"suitability_score": "Score", "material_id": ""},
         )
         fig.update_layout(
             bargap=0.15, height=320, margin=dict(l=40, r=20, t=30, b=20),
             plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-            title_text="Top 10 by Screening Score", title_font_size=13,
+            title_text=f"Top 10 — {sel_subsystem}", title_font_size=13,
         )
         fig.update_traces(marker_color="#2D6A4F")
         st.plotly_chart(fig, use_container_width=True)
@@ -753,21 +903,32 @@ with tab4:
 with tab5:
     st.markdown('<div class="sec-header">Validation Report</div>', unsafe_allow_html=True)
 
-    rc1, rc2, rc3 = st.columns(3)
+    rc1, rc2 = st.columns(2)
     with rc1:
-        report_usecase = st.selectbox("Use case", list(USE_CASE_PRESETS.keys()), key="rpt_uc")
+        report_usecase = st.selectbox("Use case preset", list(USE_CASE_PRESETS.keys()), key="rpt_uc")
     with rc2:
-        report_strength = st.number_input("Min yield (MPa)", value=250, min_value=0, key="rpt_str")
-    with rc3:
-        report_density = st.number_input("Baseline density", value=7.85, min_value=0.1, key="rpt_den")
+        rpt_subsystem = st.selectbox(
+            "Subsystem", ALL_SUBSYSTEMS,
+            index=ALL_SUBSYSTEMS.index(USE_CASE_PRESETS[report_usecase]["subsystem"]),
+            key="rpt_subsystem",
+        )
 
-    rpt_subsystem = USE_CASE_PRESETS.get(report_usecase, {}).get("subsystem", "Structural / Chassis")
+    report_strength = 0.0
+    report_density = 7.85
+    if rpt_subsystem in ("Structural / Chassis", "General Material Reuse"):
+        rc3, rc4 = st.columns(2)
+        with rc3:
+            report_strength = st.number_input("Min yield (MPa)", value=250, min_value=0, key="rpt_str")
+        with rc4:
+            report_density = st.number_input("Baseline density", value=7.85, min_value=0.1, key="rpt_den")
 
-    ranked_report = recommend_materials(unified, min_strength=report_strength,
-                                         baseline_density=report_density, use_case=report_usecase)
+    ranked_report = recommend_materials(
+        unified, subsystem=rpt_subsystem, min_strength=report_strength,
+        baseline_density=report_density, use_case=report_usecase,
+    )
 
     if ranked_report.empty:
-        st.warning("No materials match the current filters.")
+        render_empty_state(rpt_subsystem)
     else:
         report_options = ranked_report.head(20)
         report_labels = [
@@ -778,38 +939,38 @@ with tab5:
         selected_idx = report_labels.index(selected_label)
         selected = report_options.iloc[selected_idx]
 
-        # Model registry info
         active_models = get_active_models(unified)
         active_name = "structural_yield_strength"
+        model_status = "Active"
         if active_models:
             active_name = active_models[0].get("model_name", active_name)
+            model_status = active_models[0].get("status", "Active")
 
         report = build_report(
             selected, min_strength=report_strength, use_case=report_usecase,
             model_metrics=model_bundle["metrics"],
             n_reference_rows=len(unified_base), n_uploaded_rows=n_uploaded,
-            active_model_name=active_name, subsystem=rpt_subsystem,
+            active_model_name=active_name, model_status=model_status,
+            model_bundle=model_bundle, subsystem=rpt_subsystem,
+            registry_df=registry_df,
         )
 
         st.markdown(report)
 
-        # Model registry in report
         with st.expander("Model Registry"):
             st.dataframe(
                 registry_df[["model_name", "subsystem", "target", "status", "reason"]],
                 use_container_width=True, hide_index=True,
             )
 
-        # Subsystem readiness
-        with st.expander(f"Subsystem Readiness — {rpt_subsystem}"):
-            readiness = get_subsystem_readiness(selected, rpt_subsystem)
-            st.caption(f"Coverage: {readiness['coverage_pct']}% — {readiness['readiness']}")
-            if readiness["missing"]:
-                for f in readiness["missing"]:
-                    st.caption(f"• Missing: {f}")
+        with st.expander(f"Property Coverage — {rpt_subsystem}"):
+            matrix = property_coverage_matrix(unified)
+            if rpt_subsystem in matrix.index:
+                st.dataframe(matrix.loc[[rpt_subsystem]].T, use_container_width=True)
 
         st.markdown('<div class="sec-header">Validation Gate Tracker</div>', unsafe_allow_html=True)
-        for g in VALIDATION_GATES:
-            st.checkbox(g["gate"], value=False, key=f"gate_{g['gate']}", help=g["detail"])
+        profile = SUBSYSTEM_PROFILES.get(rpt_subsystem, {})
+        for gate in profile.get("validation_gates", [g["gate"] for g in VALIDATION_GATES]):
+            st.checkbox(gate, value=False, key=f"gate_{gate}")
 
         st.download_button("Download Report (.md)", data=report, file_name="matintel_report.md", mime="text/markdown")

@@ -53,9 +53,25 @@ PUBLIC_DATASET_REGISTRY: dict[str, dict] = {
         ],
         "rows": 0,
         "status": "pathway",
+        "ml_mode": "reference_screening",
         "description": (
             "Thermal/material property reference pathway for thermal protection, coatings, "
             "composites. Requires CSV export from NASA TPSX and engineer review."
+        ),
+    },
+    "engineer_upload": {
+        "name": "Engineer-reviewed evidence upload",
+        "source_type": "experimental_test",
+        "application_subsystem": "All subsystems (via schema mapping)",
+        "trust_score": 90,
+        "used_for_ml_training": False,
+        "trainable_targets": ["subsystem-specific labelled properties"],
+        "rows": 0,
+        "status": "pathway",
+        "ml_mode": "trainable_when_reviewed",
+        "description": (
+            "Upload supplier sheets, test reports, or internal data via Evidence Intake. "
+            "ML training only after engineer review and labelled property columns are mapped."
         ),
     },
 }
