@@ -813,9 +813,9 @@ with tab4:
                 for r_code in reasons.split("|"):
                     r_code = r_code.strip()
                     if r_code.startswith("+"):
-                        st.success(r_code, icon="✓")
+                        st.success(r_code, icon="✅")
                     elif r_code.startswith("-"):
-                        st.warning(r_code, icon="!")
+                        st.warning(r_code, icon="⚠️")
 
                 # Sub-scores
                 with st.expander("Sub-scores"):
