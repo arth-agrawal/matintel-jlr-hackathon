@@ -171,11 +171,23 @@ def _fuzzy_score(a: str, b: str) -> float:
     return SequenceMatcher(None, _normalize(a), _normalize(b)).ratio()
 
 
+def _is_composition_field(field: str) -> bool:
+    return bool(re.fullmatch(r"wt_percent_[a-z]+", field, re.IGNORECASE))
+
+
 def suggest_schema_mapping(uploaded_df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for col in uploaded_df.columns:
         norm = _normalize(col)
         matched = False
+        if _is_composition_field(col):
+            rows.append({
+                "uploaded_column": col,
+                "suggested_field": col,
+                "confidence": 100,
+                "match_type": "composition",
+            })
+            continue
         for sf in STANDARD_FIELDS:
             if _normalize(sf) == norm:
                 rows.append({"uploaded_column": col, "suggested_field": sf, "confidence": 100, "match_type": "exact_standard"})
@@ -275,7 +287,9 @@ def apply_schema_mapping(
         notes_parts.append("Engineer reviewed at ingest.")
 
     for upload_col, std_field in mapping_dict.items():
-        if std_field == "ignore" or std_field not in STANDARD_FIELDS:
+        if std_field == "ignore":
+            continue
+        if std_field not in STANDARD_FIELDS and not _is_composition_field(std_field):
             continue
         if upload_col not in uploaded_df.columns:
             continue

@@ -32,13 +32,13 @@ def _property_basis(row: pd.Series) -> str:
         return "Upload-evidence based (supplier sheet — requires engineer review)"
     if source == "public_reference":
         return "Reference-only (public database pathway)"
-    return "Insufficient evidence / model-predicted"
+    return "More evidence required — model-predicted or reference-only"
 
 
 def _recommendation_basis(row: pd.Series) -> str:
     basis = _property_basis(row)
     if row.get("suitability_score") is None or (isinstance(row.get("suitability_score"), float) and np.isnan(row.get("suitability_score"))):
-        return "Insufficient evidence"
+        return "More evidence required"
     if "Computed" in basis:
         return "Computed-reference based screening"
     if "Upload" in basis:
@@ -51,7 +51,7 @@ def _recommendation_basis(row: pd.Series) -> str:
 def build_report(
     row: pd.Series,
     min_strength: float,
-    use_case: str = "Lightweight Structural Component",
+    use_case: str = "Lightweight structural replacement",
     model_metrics: dict | None = None,
     n_reference_rows: int = 312,
     n_uploaded_rows: int = 0,
@@ -123,7 +123,7 @@ def build_report(
     if registry_df is not None and not registry_df.empty:
         waiting = registry_df[registry_df["status"] == "Waiting for evidence"]["model_name"].tolist()
         if waiting:
-            registry_note = f"\n- Waiting models: {', '.join(waiting)}"
+            registry_note = f"\n- Models ready for new evidence: {', '.join(waiting)}"
 
     upload_review_section = ""
     eng_reviewed = row.get("engineer_reviewed", False)
@@ -193,9 +193,9 @@ def build_report(
 - Model for screening: **{active_model_name}** — status: **{model_status}**
 - Property basis: {prop_basis}
 
-## Next Action
-Prioritise **{name}** for lab validation under the **{subsystem_val}** programme.
+## Recommended Next Action
+Prioritise **{name}** for screening under **{subsystem_val}**. Needs lab validation before approval if used beyond screening.
 
 ---
-*MatIntel is property-aware, not one-score-fits-all. Screening only — not final engineering approval.*
+*MatIntel property-aware screening report. Source basis and assumptions are tracked in the material passport.*
 """

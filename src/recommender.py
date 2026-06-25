@@ -132,7 +132,7 @@ SUBSYSTEM_SCORE_CONFIG: dict[str, dict[str, dict]] = {
 
 # Maps score dimension -> (primary field, invert, flat_neutral_msg)
 _DIM_FIELD_MAP: dict[str, tuple[str, bool, str | None]] = {
-    "thermal_score": ("thermal_conductivity_w_mk", False, "Thermal evidence missing: waiting for TPSX/JARVIS/upload"),
+    "thermal_score": ("thermal_conductivity_w_mk", False, "Add thermal property data to score this dimension"),
     "electrical_score": ("electrical_insulation_score", False, None),
     "flame_score": ("flame_retardancy_score", False, None),
     "impact_score": ("impact_resistance_score", False, None),
@@ -153,7 +153,7 @@ _DIM_FIELD_MAP: dict[str, tuple[str, bool, str | None]] = {
     "scratch_score": ("scratch_resistance_score", False, None),
     "traceability_score_norm": ("traceability_score", False, None),
     "critical_material_score": ("critical_material_risk_score", True, None),
-    "band_gap_score": ("band_gap_ev", False, "Thermal evidence missing: waiting for TPSX/JARVIS/upload"),
+    "band_gap_score": ("band_gap_ev", False, "Add band-gap data to score this dimension"),
     "stability_score": ("freezing_point", False, None),
     "cost_score": ("cost_index", True, None),
     "supply_risk_score": ("supplier_risk_score", True, None),
@@ -206,7 +206,7 @@ def recommend_materials(
     subsystem: str = "Structural / Chassis",
     min_strength: float | None = None,
     baseline_density: float = 7.85,
-    use_case: str = "Lightweight Structural Component",
+    use_case: str = "Lightweight structural replacement",
     min_trust: float = 0,
 ) -> pd.DataFrame:
     preset_sub = USE_CASE_PRESETS.get(use_case, {}).get("subsystem", subsystem)
@@ -386,20 +386,21 @@ def _reason_codes(row: pd.Series, subsystem: str, global_reasons: list[str]) -> 
     source = str(row.get("source_type", "")).lower()
     basis = str(row.get("recommendation_basis", "")).lower()
     if source == "computed_database" or "computed" in basis:
-        reasons.append("~ Computed reference coverage available — experimental validation required")
-        reasons.append("~ Property present from JARVIS/Matminer reference")
-        reasons.append("~ Not used for experimental strength model")
+        reasons.append("~ Stable reference profile from public database")
+        reasons.append("~ Property available for screening")
     elif source == "public_benchmark" or "benchmark" in basis:
-        reasons.append("~ Property present from JARVIS/Matminer reference")
-        reasons.append("~ Benchmark/reference screening — experimental validation required")
+        reasons.append("~ Stable reference profile from benchmark data")
     elif source == "supplier_sheet":
-        reasons.append("~ Supplier evidence: requires engineer review before ML training")
+        reasons.append("~ Uploaded supplier data — confirm in validation report")
     elif source in ("public_experimental", "experimental_test") and subsystem == "Structural / Chassis":
         if row.get("strength_score", 50) >= 50:
-            reasons.append("+ Meets dynamic strength target")
+            reasons.append("+ Strong predicted property")
 
     if row.get("source_trust_score", 0) >= 90:
-        reasons.append("+ High source trust (source_trust_score)")
+        reasons.append("+ High data trust")
+
+    if row.get("weight_saving_score", 50) > 55:
+        reasons.append("+ Favourable density vs baseline")
 
     profile = SUBSYSTEM_PROFILES.get(subsystem, {})
     missing_validation = []
@@ -412,7 +413,7 @@ def _reason_codes(row: pd.Series, subsystem: str, global_reasons: list[str]) -> 
         shown = ", ".join(missing_validation[:4])
         if len(missing_validation) > 4:
             shown += "…"
-        reasons.append(f"- Validation needed: {shown}")
+        reasons.append(f"- Missing validation test: {shown}")
 
     return " | ".join(dict.fromkeys(reasons))
 

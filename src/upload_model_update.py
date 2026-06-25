@@ -38,13 +38,20 @@ def assess_upload_model_impact(
     for target in targets:
         model_key = TARGET_TO_MODEL[target]
         upload_rows = int(mapped_df[target].notna().sum())
+        ml_flag = (
+            mapped_df["used_for_ml_training"].astype(str).str.lower().isin(["true", "1", "yes"])
+            if "used_for_ml_training" in mapped_df.columns
+            else pd.Series(False, index=mapped_df.index)
+        )
+        ml_eligible_rows = int((mapped_df[target].notna() & ml_flag).sum())
         spec = MODEL_TRAINING_SPECS.get(model_key)
         min_rows = int(spec["min_rows"]) if spec else 100
         implemented = model_key in MODEL_TRAINING_SPECS
 
         if implemented and upload_rows > 0:
-            combined_est = len(unified_before) + upload_rows
-            if upload_rows >= min_rows or (model_key in trained_models and upload_rows >= 10):
+            if upload_rows >= min_rows or (
+                model_key in trained_models and ml_eligible_rows >= 10
+            ):
                 action = "model_retrain_available"
                 message = f"Model update available for {model_key.replace('_', ' ')}."
             else:
