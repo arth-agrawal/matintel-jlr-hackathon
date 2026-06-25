@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pandas as pd
 
+from src.modeling import MODEL_TRAINING_SPECS, load_all_trained_models, load_model_registry
+
 
 MODEL_SPECS: dict[str, dict] = {
     "structural_yield_strength": {
@@ -12,6 +14,7 @@ MODEL_SPECS: dict[str, dict] = {
         "required_features": "wt_percent_* composition columns",
         "eligible_source_types": ["public_experimental", "experimental_test"],
         "model_type": "Best selected tabular regressor",
+        "model_family": "experimental",
         "status": "implemented",
         "description": "Experimental yield strength from steel composition — active model.",
     },
@@ -21,34 +24,38 @@ MODEL_SPECS: dict[str, dict] = {
         "required_features": "wt_percent_* composition columns",
         "eligible_source_types": ["public_experimental", "experimental_test"],
         "model_type": "Tabular regressor",
+        "model_family": "experimental",
         "status": "trainable",
         "description": "Tensile strength — trainable next if UTS labels exist.",
     },
     "computed_formation_energy": {
         "subsystem": "General Material Reuse / Battery / Electronics",
         "target": "formation_energy_per_atom",
-        "required_features": "formula or density_g_cm3 descriptor",
+        "required_features": "formula descriptors + density_g_cm3",
         "eligible_source_types": ["computed_database", "public_benchmark"],
         "model_type": "Tabular regressor",
-        "status": "trainable",
+        "model_family": "computed_reference",
+        "status": "implemented",
         "description": "Formation energy from JARVIS / matbench computed reference.",
     },
     "computed_band_gap": {
         "subsystem": "Electronics / Thermal Interface",
         "target": "band_gap_ev",
-        "required_features": "formula or density_g_cm3 descriptor",
+        "required_features": "formula descriptors + density_g_cm3",
         "eligible_source_types": ["computed_database", "public_benchmark"],
         "model_type": "Tabular regressor",
-        "status": "trainable",
+        "model_family": "computed_reference",
+        "status": "implemented",
         "description": "Band gap from JARVIS / matbench reference data.",
     },
     "elastic_modulus_proxy": {
         "subsystem": "Structural reference / General Material Reuse",
         "target": "bulk_modulus_gpa",
-        "required_features": "formula or density_g_cm3",
+        "required_features": "formula descriptors + density_g_cm3",
         "eligible_source_types": ["computed_database", "public_benchmark"],
         "model_type": "Tabular regressor",
-        "status": "trainable",
+        "model_family": "computed_reference",
+        "status": "implemented",
         "description": "Bulk/shear modulus proxy from matbench/JARVIS reference.",
         "alt_target": "shear_modulus_gpa",
     },
@@ -58,6 +65,7 @@ MODEL_SPECS: dict[str, dict] = {
         "required_features": "composition or material descriptor features",
         "eligible_source_types": ["public_reference", "experimental_test", "public_experimental"],
         "model_type": "Tabular regressor",
+        "model_family": "experimental",
         "status": "waiting",
         "description": "Thermal conductivity — waiting for TPSX/upload labelled data.",
     },
@@ -67,6 +75,7 @@ MODEL_SPECS: dict[str, dict] = {
         "required_features": "interior-specific test fields",
         "eligible_source_types": ["experimental_test", "supplier_sheet"],
         "model_type": "Tabular regressor",
+        "model_family": "experimental",
         "status": "waiting",
         "description": "Interior foam models — waiting for upload evidence.",
     },
@@ -76,12 +85,20 @@ MODEL_SPECS: dict[str, dict] = {
         "required_features": "tyre-specific test fields",
         "eligible_source_types": ["experimental_test", "supplier_sheet"],
         "model_type": "Tabular regressor",
+        "model_family": "experimental",
         "status": "waiting",
         "description": "Tyre/elastomer models — waiting for upload evidence.",
     },
 }
 
 COMPUTED_SOURCE_TYPES = {"computed_database", "public_benchmark"}
+
+SUBSYSTEM_ACTIVE_MODELS: dict[str, list[str]] = {
+    "Structural / Chassis": ["structural_yield_strength", "elastic_modulus_proxy"],
+    "Electronics / Thermal Interface": ["computed_band_gap"],
+    "Battery Enclosure / Underbody": ["computed_formation_energy"],
+    "General Material Reuse": ["computed_formation_energy", "elastic_modulus_proxy"],
+}
 
 
 def _eligible_rows(unified_df: pd.DataFrame, target: str, eligible_types: list[str]) -> pd.Series:
@@ -116,8 +133,16 @@ def _feature_count(unified_df: pd.DataFrame, spec: dict) -> int:
     return count
 
 
+def _trained_model_keys() -> set[str]:
+    trained = load_all_trained_models()
+    return set(trained.keys())
+
+
 def detect_trainable_targets(unified_df: pd.DataFrame) -> pd.DataFrame:
+    trained_keys = _trained_model_keys()
+    registry_meta = {m["model_key"]: m for m in load_model_registry()}
     rows = []
+
     for model_name, spec in MODEL_SPECS.items():
         target = spec["target"]
         eligible_types = spec["eligible_source_types"]
@@ -134,11 +159,24 @@ def detect_trainable_targets(unified_df: pd.DataFrame) -> pd.DataFrame:
                 eligible_count = int(alt_mask.sum())
 
         feature_count = _feature_count(unified_df, spec)
-        is_computed = any(t in COMPUTED_SOURCE_TYPES for t in eligible_types)
+        is_computed = spec.get("model_family") == "computed_reference"
+        min_rows = int(MODEL_TRAINING_SPECS.get(model_name, {}).get("min_rows", 30))
 
-        if spec["status"] == "implemented":
-            status = "Active"
-            reason = f"Trained experimental model on {eligible_count} eligible rows."
+        if model_name in trained_keys:
+            meta = registry_meta.get(model_name, {})
+            family = spec.get("model_family", "experimental")
+            if family == "computed_reference":
+                status = "Active computed-reference"
+                reason = (
+                    f"Trained computed-reference model on {meta.get('rows', eligible_count)} rows "
+                    f"({meta.get('selected_algorithm', 'tabular regressor')}). "
+                    "Validation required before engineering release."
+                )
+            else:
+                status = "Active"
+                reason = (
+                    f"Trained experimental model on {meta.get('rows', eligible_count)} eligible rows."
+                )
         elif spec["status"] == "waiting":
             if eligible_count > 0:
                 status = "Insufficient data"
@@ -146,14 +184,12 @@ def detect_trainable_targets(unified_df: pd.DataFrame) -> pd.DataFrame:
             else:
                 status = "Waiting for evidence"
                 reason = f"Waiting for {target} from TPSX/upload/supplier evidence."
-        elif eligible_count >= 30 and feature_count >= 1:
-            status = "Trainable next" if is_computed else "Trainable"
-            label = "Computed-reference trainable" if is_computed else "Trainable"
-            status = label
-            reason = f"{eligible_count} eligible rows from JARVIS/matbench/reference sources."
+        elif eligible_count >= min_rows and feature_count >= 1:
+            status = "Computed-reference trainable" if is_computed else "Trainable"
+            reason = f"{eligible_count} eligible rows from reference sources."
         elif eligible_count > 0:
             status = "Insufficient data"
-            reason = f"Only {eligible_count} eligible rows (need 30+)."
+            reason = f"Only {eligible_count} eligible rows (need {min_rows}+)."
         else:
             status = "Waiting for evidence"
             reason = (
@@ -170,6 +206,7 @@ def detect_trainable_targets(unified_df: pd.DataFrame) -> pd.DataFrame:
             "status": status,
             "reason": reason,
             "model_type": spec["model_type"],
+            "model_family": spec.get("model_family", "experimental"),
         })
 
     return pd.DataFrame(rows)
@@ -177,10 +214,23 @@ def detect_trainable_targets(unified_df: pd.DataFrame) -> pd.DataFrame:
 
 def get_active_models(unified_df: pd.DataFrame) -> list[dict]:
     registry = detect_trainable_targets(unified_df)
-    active_statuses = ["Active", "Trainable", "Trainable next", "Computed-reference trainable"]
+    active_statuses = [
+        "Active", "Active computed-reference",
+        "Trainable", "Trainable next", "Computed-reference trainable",
+    ]
     return registry[registry["status"].isin(active_statuses)].to_dict("records")
 
 
 def get_trainable_next_models(unified_df: pd.DataFrame) -> list[dict]:
     registry = detect_trainable_targets(unified_df)
-    return registry[registry["status"].isin(["Trainable next", "Computed-reference trainable", "Trainable"])].to_dict("records")
+    return registry[registry["status"].isin([
+        "Trainable next", "Computed-reference trainable", "Trainable",
+    ])].to_dict("records")
+
+
+def get_trained_models_for_subsystem(subsystem: str, trained_models: dict | None = None) -> list[str]:
+    """Return model keys trained and mapped to a subsystem."""
+    if trained_models is None:
+        trained_models = load_all_trained_models()
+    keys = SUBSYSTEM_ACTIVE_MODELS.get(subsystem, [])
+    return [k for k in keys if k in trained_models]

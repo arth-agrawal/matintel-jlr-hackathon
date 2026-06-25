@@ -1,0 +1,123 @@
+[
+  {
+    "model_key": "structural_yield_strength",
+    "target": "yield_strength_mpa",
+    "model_family": "experimental",
+    "rows": 312,
+    "features": [
+      "wt_percent_c",
+      "wt_percent_mn",
+      "wt_percent_si",
+      "wt_percent_cr",
+      "wt_percent_ni",
+      "wt_percent_mo",
+      "wt_percent_v",
+      "wt_percent_nb",
+      "wt_percent_al",
+      "wt_percent_co",
+      "wt_percent_n",
+      "wt_percent_ti",
+      "wt_percent_w"
+    ],
+    "selected_algorithm": "ExtraTreesRegressor",
+    "r2": 0.8717,
+    "mae": 70.4836,
+    "rmse": 94.7539,
+    "source_datasets": [
+      "matminer_steel_strength"
+    ],
+    "recommendation_basis": "observed-data based screening",
+    "subsystem": "Structural / Chassis",
+    "limitation_label": "Measured-data prediction",
+    "timestamp": "2026-06-25T06:22:54.526750+00:00"
+  },
+  {
+    "model_key": "computed_band_gap",
+    "target": "band_gap_ev",
+    "model_family": "computed_reference",
+    "rows": 6000,
+    "features": [
+      "n_elements",
+      "mean_atomic_number",
+      "min_atomic_number",
+      "max_atomic_number",
+      "range_atomic_number",
+      "mean_atomic_weight",
+      "total_atoms",
+      "density_g_cm3_feat",
+      "source_trust_score_feat"
+    ],
+    "selected_algorithm": "HistGradientBoostingRegressor",
+    "r2": 0.6328,
+    "mae": 0.523,
+    "rmse": 0.8908,
+    "source_datasets": [
+      "jarvis_dft_3d",
+      "matbench_expt_gap",
+      "matbench_mp_gap"
+    ],
+    "recommendation_basis": "computed-reference based screening",
+    "subsystem": "Electronics / Thermal Interface",
+    "limitation_label": "Computed-reference screening model \u2014 validation required before engineering release",
+    "timestamp": "2026-06-25T06:22:56.500499+00:00"
+  },
+  {
+    "model_key": "computed_formation_energy",
+    "target": "formation_energy_per_atom",
+    "model_family": "computed_reference",
+    "rows": 5500,
+    "features": [
+      "n_elements",
+      "mean_atomic_number",
+      "min_atomic_number",
+      "max_atomic_number",
+      "range_atomic_number",
+      "mean_atomic_weight",
+      "total_atoms",
+      "density_g_cm3_feat",
+      "source_trust_score_feat"
+    ],
+    "selected_algorithm": "ExtraTreesRegressor",
+    "r2": 0.8843,
+    "mae": 0.303,
+    "rmse": 0.4656,
+    "source_datasets": [
+      "jarvis_dft_3d",
+      "matbench_mp_e_form"
+    ],
+    "recommendation_basis": "computed-reference based screening",
+    "subsystem": "Battery Enclosure / Underbody / General Material Reuse",
+    "limitation_label": "Computed-reference screening model \u2014 validation required before engineering release",
+    "timestamp": "2026-06-25T06:22:58.174430+00:00"
+  },
+  {
+    "model_key": "elastic_modulus_proxy",
+    "target": "bulk_modulus_gpa",
+    "model_family": "computed_reference",
+    "rows": 2421,
+    "features": [
+      "n_elements",
+      "mean_atomic_number",
+      "min_atomic_number",
+      "max_atomic_number",
+      "range_atomic_number",
+      "mean_atomic_weight",
+      "total_atoms",
+      "density_g_cm3_feat",
+      "source_trust_score_feat"
+    ],
+    "selected_algorithm": "ExtraTreesRegressor",
+    "r2": 0.5682,
+    "mae": 28.01,
+    "rmse": 40.9741,
+    "source_datasets": [
+      "jarvis_dft_3d",
+      "matbench_log_gvrh",
+      "matbench_log_kvrh"
+    ],
+    "recommendation_basis": "computed-reference based screening",
+    "subsystem": "Structural reference / General Material Reuse",
+    "limitation_label": "Computed-reference screening model \u2014 validation required before engineering release",
+    "timestamp": "2026-06-25T06:22:59.646470+00:00"
+  }
+]

@@ -125,6 +125,18 @@ def build_report(
         if waiting:
             registry_note = f"\n- Waiting models: {', '.join(waiting)}"
 
+    upload_review_section = ""
+    eng_reviewed = row.get("engineer_reviewed", False)
+    assumption_notes = row.get("data_assumption_notes", "")
+    upload_notes = str(row.get("notes", ""))
+    if eng_reviewed or assumption_notes or "Mapping:" in upload_notes:
+        upload_review_section = f"""
+## Upload & Mapping Clarifications
+- **Engineer reviewed:** {'Yes' if str(eng_reviewed).lower() in ('true', '1') else 'No'}
+- **Mapping / assumption notes:** {_fmt(assumption_notes or upload_notes)}
+- **Unresolved fields:** preserve as extra_* columns until validated
+"""
+
     return f"""# MatIntel Decision Report
 
 ## Selected Subsystem
@@ -148,6 +160,7 @@ def build_report(
 
 ## Evidence Source Provenance
 - Public reference: matminer steel_strength ({n_reference_rows} experimental steel alloys, trust 95/100){uploaded_line}{model_line}{registry_note}
+{upload_review_section}
 
 ## Evidence Coverage
 - **Available important fields:** {available_fields}

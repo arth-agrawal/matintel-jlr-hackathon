@@ -95,31 +95,186 @@ SUBSYSTEM_DISPLAY_COLUMNS: dict[str, list[str]] = {
     ],
 }
 
-# Property-based subsystem relevance — rows can appear in multiple subsystem views
+# Property-based subsystem relevance — tightened inference (not OR-of-single-fields)
+COMPUTED_SOURCE_TYPES = {"computed_database", "public_benchmark"}
+EXPERIMENTAL_SOURCE_TYPES = {"public_experimental", "experimental_test"}
+# Subsystem tags on computed/benchmark rows are routing hints — not engineer assignments.
+EXPLICIT_TAG_SOURCE_TYPES = EXPERIMENTAL_SOURCE_TYPES | {
+    "supplier_sheet", "sustainability_sheet", "procurement_sheet", "unknown",
+}
+
+
+def _explicit_subsystem_tag_mask(df: pd.DataFrame, subsystem: str) -> pd.Series:
+    """Rows explicitly assigned to a subsystem (experimental uploads / engineer review)."""
+    if df.empty or "application_subsystem" not in df.columns:
+        return pd.Series(False, index=df.index)
+    match = df["application_subsystem"] == subsystem
+    reviewed = (
+        df["engineer_reviewed"].astype(str).str.lower().isin(["true", "1"])
+        if "engineer_reviewed" in df.columns
+        else pd.Series(False, index=df.index)
+    )
+    if "source_type" in df.columns:
+        explicit = df["source_type"].isin(EXPLICIT_TAG_SOURCE_TYPES)
+        return match & (reviewed | explicit)
+    return match & reviewed
+
+
+def _measured_mask(df: pd.DataFrame, field: str) -> pd.Series:
+    if field not in df.columns:
+        return pd.Series(False, index=df.index)
+    mask = df[field].notna()
+    if "assumption_fields" in df.columns:
+        mask = mask & ~is_assumption_field_series(df, field)
+    return mask
+
+
+def _any_measured(df: pd.DataFrame, fields: list[str]) -> pd.Series:
+    mask = pd.Series(False, index=df.index)
+    for field in fields:
+        mask = mask | _measured_mask(df, field)
+    return mask
+
+
+def _tagged_mask(df: pd.DataFrame, subsystem: str) -> pd.Series:
+    return _explicit_subsystem_tag_mask(df, subsystem)
+
+
+def _inferred_mask(df: pd.DataFrame, subsystem: str) -> pd.Series:
+    """Property-aware inference — excludes rows matched only by weak signals."""
+    if df.empty:
+        return pd.Series(False, index=df.index)
+
+    if subsystem == "General Material Reuse":
+        return pd.Series(True, index=df.index)
+
+    if subsystem == "Structural / Chassis":
+        return _any_measured(df, [
+            "yield_strength_mpa", "ultimate_tensile_strength_mpa",
+            "bulk_modulus_gpa", "shear_modulus_gpa",
+        ])
+
+    if subsystem == "Electronics / Thermal Interface":
+        m = _any_measured(df, [
+            "band_gap_ev", "dielectric_constant",
+            "electrical_insulation_score", "thermal_conductivity_w_mk",
+        ])
+        if "source_type" in df.columns:
+            m = m & df["source_type"].isin(COMPUTED_SOURCE_TYPES | {"public_reference"})
+        return m
+
+    if subsystem == "Battery Enclosure / Underbody":
+        m = _any_measured(df, [
+            "formation_energy_per_atom", "band_gap_ev", "flame_retardancy_score",
+            "impact_resistance_score", "corrosion_resistance_score", "electrical_insulation_score",
+        ])
+        if "source_type" in df.columns:
+            m = m & df["source_type"].isin(COMPUTED_SOURCE_TYPES)
+        return m
+
+    if subsystem == "Thermal Fluids / Coolants":
+        thermal = _measured_mask(df, "thermal_conductivity_w_mk")
+        secondary = _any_measured(df, [
+            "specific_heat", "viscosity", "boiling_point", "freezing_point", "corrosion_inhibition_score",
+        ])
+        return thermal & secondary
+
+    if subsystem == "Interior / Seating / Foam":
+        return _any_measured(df, [
+            "comfort_score", "durability_score", "voc_emission_score",
+            "fire_safety_score", "recycled_content_percent", "co2_kg_per_kg",
+        ])
+
+    if subsystem == "Tyres / Elastomers":
+        return _any_measured(df, [
+            "wear_resistance_score", "rolling_resistance_score", "grip_score", "bio_based_content_percent",
+        ])
+
+    if subsystem == "Coatings / Corrosion Protection":
+        return _any_measured(df, [
+            "corrosion_resistance_score", "salt_spray_hours", "adhesion_score",
+            "scratch_resistance_score", "voc_emission_score",
+        ])
+
+    return pd.Series(False, index=df.index)
+
+
+def filter_tagged_rows(df: pd.DataFrame, subsystem: str) -> pd.DataFrame:
+    if subsystem == "General Material Reuse":
+        return df.copy()
+    return df[_tagged_mask(df, subsystem)].copy()
+
+
+def filter_inferred_rows(df: pd.DataFrame, subsystem: str) -> pd.DataFrame:
+    """Rows matching property inference (computed/reference), excluding explicit tags."""
+    if subsystem == "General Material Reuse":
+        return df.copy()
+    inferred = _inferred_mask(df, subsystem)
+    if "source_type" in df.columns:
+        ref_rows = df["source_type"].isin(COMPUTED_SOURCE_TYPES | {"public_reference"})
+        inferred = inferred & ref_rows
+    tagged = _tagged_mask(df, subsystem)
+    return df[inferred & ~tagged].copy()
+
+
+def count_training_rows(df: pd.DataFrame, subsystem: str) -> int:
+    """Rows eligible for experimental ML training in this subsystem context."""
+    if df.empty:
+        return 0
+    sub = filter_subsystem_rows(df, subsystem)
+    if "used_for_ml_training" not in sub.columns:
+        return 0
+    ml = sub["used_for_ml_training"].astype(str).str.lower().isin(["true", "1"])
+    exp = sub["source_type"].isin(EXPERIMENTAL_SOURCE_TYPES) if "source_type" in sub.columns else ml
+    return int((ml & exp).sum())
+
+
+def subsystem_coverage_counts(df: pd.DataFrame, subsystem: str) -> dict[str, int]:
+    """Honest tagged / inferred / training counts for cockpit cards."""
+    if subsystem == "General Material Reuse":
+        return {
+            "tagged_rows": len(df),
+            "inferred_rows": 0,
+            "training_rows": count_training_rows(df, subsystem),
+            "relevant_rows": len(df),
+        }
+    tagged = int(_tagged_mask(df, subsystem).sum())
+    inferred_only = len(filter_inferred_rows(df, subsystem))
+    relevant = len(filter_subsystem_rows(df, subsystem))
+    return {
+        "tagged_rows": tagged,
+        "inferred_rows": inferred_only,
+        "training_rows": count_training_rows(df, subsystem),
+        "relevant_rows": relevant,
+    }
+
+
+# Legacy field list for property matrix columns
 SUBSYSTEM_PROPERTY_MATCH: dict[str, list[str]] = {
     "Structural / Chassis": [
         "yield_strength_mpa", "ultimate_tensile_strength_mpa", "bulk_modulus_gpa", "shear_modulus_gpa",
     ],
     "Battery Enclosure / Underbody": [
-        "formation_energy_per_atom", "band_gap_ev", "density_g_cm3", "thermal_conductivity_w_mk",
+        "formation_energy_per_atom", "band_gap_ev", "flame_retardancy_score",
+        "impact_resistance_score", "corrosion_resistance_score", "electrical_insulation_score",
     ],
     "Electronics / Thermal Interface": [
-        "band_gap_ev", "dielectric_constant", "thermal_conductivity_w_mk", "electrical_insulation_score",
+        "band_gap_ev", "dielectric_constant", "electrical_insulation_score", "thermal_conductivity_w_mk",
     ],
     "Interior / Seating / Foam": [
         "voc_emission_score", "fire_safety_score", "comfort_score", "durability_score",
+        "recycled_content_percent", "co2_kg_per_kg",
     ],
-    "Tyres / Elastomers": ["wear_resistance_score", "rolling_resistance_score", "grip_score"],
+    "Tyres / Elastomers": [
+        "wear_resistance_score", "rolling_resistance_score", "grip_score", "bio_based_content_percent",
+    ],
     "Thermal Fluids / Coolants": [
         "thermal_conductivity_w_mk", "specific_heat", "viscosity", "freezing_point", "boiling_point",
     ],
     "Coatings / Corrosion Protection": [
         "corrosion_resistance_score", "salt_spray_hours", "adhesion_score", "scratch_resistance_score",
     ],
-    "General Material Reuse": [
-        "density_g_cm3", "formation_energy_per_atom", "band_gap_ev",
-        "bulk_modulus_gpa", "shear_modulus_gpa", "yield_strength_mpa",
-    ],
+    "General Material Reuse": [],
 }
 
 SUBSYSTEM_TRUSTED_SOURCES: dict[str, list[str]] = {
@@ -191,29 +346,16 @@ def field_has_variance(df: pd.DataFrame, field: str, min_std: float = 0.01) -> b
 
 
 def filter_subsystem_rows(df: pd.DataFrame, subsystem: str) -> pd.DataFrame:
-    """Return rows relevant to subsystem by tag OR property presence."""
+    """Return rows relevant to subsystem: tagged OR property-inferred (tight rules)."""
     if df.empty:
         return df.copy()
 
     if subsystem == "General Material Reuse":
         return df.copy()
 
-    masks = []
-
-    if "application_subsystem" in df.columns:
-        masks.append(df["application_subsystem"] == subsystem)
-
-    prop_fields = SUBSYSTEM_PROPERTY_MATCH.get(subsystem, [])
-    for field in prop_fields:
-        if field in df.columns:
-            masks.append(df[field].notna())
-
-    if not masks:
-        return df.iloc[0:0].copy()
-
-    combined = masks[0]
-    for m in masks[1:]:
-        combined = combined | m
+    tagged = _tagged_mask(df, subsystem)
+    inferred = _inferred_mask(df, subsystem)
+    combined = tagged | inferred
     return df[combined].copy()
 
 

@@ -16,7 +16,10 @@ from src.data_pipeline import (
     DEMO_ENRICHMENT_COLS, QUARANTINED_DEMO_FIELDS,
 )
 from src.data_assumptions import format_field_display, is_assumption_field, ASSUMPTION_NOTE
-from src.modeling import load_or_train_model, predict_with_interval
+from src.modeling import (
+    load_or_train_model, load_or_train_models, load_all_trained_models,
+    predict_with_interval, MODEL_TRAINING_SPECS,
+)
 from src.confidence import confidence_score
 from src.recommender import (
     recommend_materials, USE_CASE_PRESETS,
@@ -24,12 +27,24 @@ from src.recommender import (
 )
 from src.report_generator import build_report, VALIDATION_GATES
 from src.schema_mapper import (
-    suggest_schema_mapping, apply_schema_mapping, assess_ml_eligibility,
+    suggest_schema_mapping, apply_schema_mapping,
     STANDARD_FIELDS, SOURCE_TYPE_PROFILES, ALL_SOURCE_TYPES, esc,
 )
 from src.public_sources import (
     PUBLIC_DATASET_REGISTRY, load_jarvis_dft, load_trusted_public_bundle,
     load_matminer_extra_datasets, summarize_sources, jarvis_property_coverage,
+    auto_load_trusted_reference, build_jarvis_cache,
+    CACHE_JARVIS_500, CACHE_JARVIS_5000, CACHE_MATBENCH_COMBINED,
+)
+from src.evidence_cockpit import (
+    build_all_subsystem_cards, compute_hero_metrics, build_coverage_table,
+    render_subsystem_card_html, render_evidence_flow_html,
+)
+from src.upload_workflow import (
+    UPLOAD_GUIDELINES, SUBSYSTEM_COLUMN_GUIDANCE, SUBSYSTEM_TEMPLATE_COLUMNS,
+    template_download_bytes, enrich_mapping_with_units,
+    critical_mappings_unresolved,
+    ingest_approved_evidence, compute_ml_eligibility, DENSITY_UNIT_OPTIONS,
 )
 from src.model_registry import detect_trainable_targets, get_active_models, get_trainable_next_models, MODEL_SPECS
 from src.subsystem_profiles import SUBSYSTEM_PROFILES, ALL_SUBSYSTEMS, get_subsystem_readiness
@@ -124,6 +139,26 @@ PREMIUM_CSS = """
 .sec-header { font-size: 0.72rem; font-weight: 600; text-transform: uppercase;
     letter-spacing: 1px; color: var(--green-mid); margin: 20px 0 10px;
     padding-bottom: 4px; border-bottom: 2px solid var(--green-light); }
+.subsys-card { border: 1px solid var(--border-light); border-radius: 10px; padding: 14px 16px;
+    background: white; min-height: 280px; margin-bottom: 8px; }
+.subsys-card h4 { margin: 0 0 6px; font-size: 0.88rem; font-weight: 600; color: var(--racing-green); line-height: 1.25; }
+.subsys-card .card-num { font-size: 1.4rem; font-weight: 700; color: var(--racing-green); }
+.subsys-card .card-rows { margin: 0 0 8px; font-size: 0.78rem; color: var(--text-secondary); }
+.subsys-card .card-meta { margin: 3px 0; font-size: 0.74rem; color: var(--text-secondary); line-height: 1.35; }
+.subsys-card .card-list { margin: 4px 0; padding-left: 16px; font-size: 0.72rem; }
+.subsys-card .card-cta { font-size: 0.72rem; color: var(--gold); font-weight: 600; margin-top: 6px; }
+.callout-premium { border: 1px solid var(--gold-muted); border-radius: 10px; padding: 16px 20px;
+    background: linear-gradient(135deg, #FFFDF8 0%, white 100%); margin: 12px 0; }
+.flow-section { display: flex; align-items: stretch; gap: 8px; margin: 16px 0; flex-wrap: wrap; }
+.flow-col { flex: 1; min-width: 180px; border: 1px solid var(--border-light); border-radius: 8px;
+    padding: 12px; background: white; }
+.flow-title { font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px;
+    color: var(--gold); margin-bottom: 8px; }
+.flow-node { font-size: 0.78rem; padding: 6px 8px; margin: 4px 0; background: var(--warm-white);
+    border-radius: 6px; border-left: 3px solid var(--green-light); }
+.flow-node.flow-sub { border-left-color: var(--gold); }
+.flow-node.flow-out { border-left-color: var(--racing-green); }
+.flow-arrow { display: flex; align-items: center; font-size: 1.2rem; color: var(--green-mid); font-weight: 700; }
 section[data-testid="stSidebar"] { background: var(--graphite) !important; }
 section[data-testid="stSidebar"] * { color: rgba(255,255,255,0.85) !important; }
 section[data-testid="stSidebar"] .stMarkdown strong { color: var(--gold-muted) !important; }
@@ -138,9 +173,25 @@ st.markdown(PREMIUM_CSS, unsafe_allow_html=True)
 def cached_data():
     return load_or_create_unified()
 
-@st.cache_resource(show_spinner="Loading prediction model …")
-def cached_model(_unified):
-    return load_or_train_model(_unified)
+@st.cache_data(show_spinner="Preparing training universe …")
+def cached_training_unified():
+    """Steel + cached reference rows used for property-specific model training."""
+    _, steel = load_or_create_unified()
+    ref, _ = auto_load_trusted_reference()
+    if ref.empty:
+        cached_ref = load_public_reference()
+        ref = cached_ref if not cached_ref.empty else pd.DataFrame()
+    if ref.empty:
+        return steel
+    return pd.concat([steel, ref], ignore_index=True)
+
+@st.cache_resource(show_spinner="Loading prediction models …")
+def cached_models(_rows: int):
+    """Load saved models from bootstrap; train only if none exist on disk."""
+    trained = load_all_trained_models()
+    if trained:
+        return trained
+    return load_or_train_models(cached_training_unified())
 
 try:
     raw, unified_base = cached_data()
@@ -150,7 +201,12 @@ except Exception as e:
     st.stop()
 
 try:
-    model_bundle = cached_model(unified_base)
+    training_unified = cached_training_unified()
+    all_models = cached_models(len(training_unified))
+    model_bundle = all_models.get("structural_yield_strength")
+    if model_bundle is None:
+        model_bundle = load_or_train_model(unified_base)
+        all_models["structural_yield_strength"] = model_bundle
 except Exception as e:
     st.error(f"**Model training failed:** {e}")
     st.stop()
@@ -159,9 +215,32 @@ except Exception as e:
 
 if "uploaded_rows" not in st.session_state:
     st.session_state["uploaded_rows"] = pd.DataFrame()
+if "upload_confirmations" not in st.session_state:
+    st.session_state["upload_confirmations"] = {}
+if "last_ingest_summary" not in st.session_state:
+    st.session_state["last_ingest_summary"] = None
 if "public_reference_rows" not in st.session_state:
-    cached_ref = load_public_reference()
-    st.session_state["public_reference_rows"] = cached_ref if not cached_ref.empty else pd.DataFrame()
+    ref_df, ref_msgs = auto_load_trusted_reference()
+    if ref_df.empty:
+        cached_ref = load_public_reference()
+        st.session_state["public_reference_rows"] = cached_ref if not cached_ref.empty else pd.DataFrame()
+    else:
+        st.session_state["public_reference_rows"] = ref_df
+    st.session_state["reference_load_messages"] = ref_msgs
+    st.session_state["reference_load_meta"] = {
+        "jarvis_cached": CACHE_JARVIS_500.exists() or CACHE_JARVIS_5000.exists(),
+        "jarvis_5000": CACHE_JARVIS_5000.exists(),
+        "matbench_cached": CACHE_MATBENCH_COMBINED.exists(),
+    }
+
+ref_meta = st.session_state.get(
+    "reference_load_meta",
+    {
+        "jarvis_cached": CACHE_JARVIS_500.exists() or CACHE_JARVIS_5000.exists(),
+        "jarvis_5000": CACHE_JARVIS_5000.exists(),
+        "matbench_cached": CACHE_MATBENCH_COMBINED.exists(),
+    },
+)
 
 parts = [unified_base]
 if not st.session_state["public_reference_rows"].empty:
@@ -175,21 +254,20 @@ n_public_ref = len(st.session_state["public_reference_rows"])
 n_jarvis = int(
     st.session_state["public_reference_rows"]["source_dataset"].astype(str).str.startswith("jarvis").sum()
 ) if n_public_ref > 0 and "source_dataset" in st.session_state["public_reference_rows"].columns else 0
+n_matbench = int(
+    st.session_state["public_reference_rows"]["source_dataset"].astype(str).str.startswith("matbench").sum()
+) if n_public_ref > 0 and "source_dataset" in st.session_state["public_reference_rows"].columns else 0
 M = model_bundle["metrics"]
 MODEL_ALGO = model_bundle.get("model_name", "RandomForestRegressor")
 registry_df = detect_trainable_targets(unified)
 trainable_next = get_trainable_next_models(unified)
 active_models = get_active_models(unified)
-
-source_datasets = unified["source_dataset"].nunique() if "source_dataset" in unified.columns else 1
-ml_rows = int(
-    (unified.get("used_for_ml_training", pd.Series(dtype=bool))
-     .astype(str).str.lower().isin(["true", "1"])).sum()
+hero = compute_hero_metrics(
+    unified, registry_df, all_models,
+    n_steel=int(unified_base["source_dataset"].eq("matminer_steel_strength").sum())
+    if "source_dataset" in unified_base.columns else len(unified_base),
 )
-computed_rows = int(
-    unified["source_type"].isin(["computed_database", "public_benchmark"]).sum()
-) if "source_type" in unified.columns else 0
-avg_trust = round(unified["source_trust_score"].mean(), 1) if "source_trust_score" in unified.columns else 0
+subsystem_cards = build_all_subsystem_cards(unified, registry_df)
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -415,7 +493,12 @@ with st.sidebar:
         "**L5** Validation report"
     )
     st.divider()
-    st.markdown(f"**Sources:** {source_datasets}  \n**Materials:** {len(unified)}  \n**ML rows:** {ml_rows}")
+    st.markdown(
+        f"**Sources:** {hero['evidence_sources_active']}  \n"
+        f"**Materials:** {hero['unified_materials']}  \n"
+        f"**Trained models:** {hero['active_trained_models']} "
+        f"({hero['experimental_trained_models']} exp + {hero['computed_reference_trained_models']} computed)"
+    )
     st.divider()
     st.markdown(f"**Best model:** {MODEL_ALGO}  \nR² **{M['R2']}** · MAE **{M['MAE']}** MPa")
     st.divider()
@@ -426,18 +509,23 @@ with st.sidebar:
 st.markdown("""<div class="hero-block">
 <h1>MatIntel</h1>
 <p class="subtitle">Governed Material Intelligence for JLR Engineering</p>
-<p class="tagline">MatIntel loads multiple trusted public evidence sources. Experimental steel data trains the active structural model; JARVIS and Matminer computed/reference datasets expand the searchable material universe across electronics, battery, structural reference, and general reuse. TPSX and reviewed uploads extend thermal, coatings, interiors, and supplier-specific evidence.</p>
+<p class="tagline">All unified records are used in the intelligence layer for passport, search, and scoring. MatIntel trains separate property-specific models instead of forcing one universal model across unrelated targets. Computed-reference models are screening tools — validation required before engineering release.</p>
 </div>""", unsafe_allow_html=True)
 
 st.markdown(f"""<div class="metric-strip">
-<div class="metric-chip"><p class="mv">{source_datasets}</p><p class="ml">Evidence Sources</p></div>
-<div class="metric-chip"><p class="mv">{len(unified)}</p><p class="ml">Unified Materials</p></div>
-<div class="metric-chip"><p class="mv">{ml_rows}</p><p class="ml">Experimental ML Rows</p></div>
-<div class="metric-chip"><p class="mv">{computed_rows}</p><p class="ml">Computed/Reference Rows</p></div>
-<div class="metric-chip"><p class="mv">{len(active_models)}</p><p class="ml">Active Models</p></div>
-<div class="metric-chip"><p class="mv">{len(trainable_next)}</p><p class="ml">Trainable Next</p></div>
-<div class="metric-chip"><p class="mv">{avg_trust}</p><p class="ml">Avg Source Trust</p></div>
+<div class="metric-chip"><p class="mv">{hero['evidence_sources_active']}</p><p class="ml">Evidence Sources Active</p></div>
+<div class="metric-chip"><p class="mv">{hero['unified_materials']}</p><p class="ml">Unified Material Records</p></div>
+<div class="metric-chip"><p class="mv">{hero['experimental_ml_rows']}</p><p class="ml">Experimental Training Rows</p></div>
+<div class="metric-chip"><p class="mv">{hero['computed_reference_rows']}</p><p class="ml">Computed/Reference Records</p></div>
+<div class="metric-chip"><p class="mv">{hero['active_trained_models']}</p><p class="ml">Active Trained Models</p></div>
+<div class="metric-chip"><p class="mv">{hero['experimental_trained_models']}</p><p class="ml">Experimental Trained Models</p></div>
+<div class="metric-chip"><p class="mv">{hero['computed_reference_trained_models']}</p><p class="ml">Computed-Reference Trained</p></div>
+<div class="metric-chip"><p class="mv">{hero['waiting_for_evidence']}</p><p class="ml">Waiting for Evidence</p></div>
 </div>""", unsafe_allow_html=True)
+st.caption(
+    "Default universe loads from cache. Heavy public datasets can be refreshed below in Evidence Intake. "
+    "All records participate in the intelligence layer; each model trains only on rows with valid targets and features."
+)
 
 # ── Tabs ─────────────────────────────────────────────────────────────────────
 
@@ -451,160 +539,99 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 # ═════════════════════════════════════════════════════════════════════════════
 
 with tab1:
-    st.markdown('<div class="sec-header">Trusted Public Dataset Registry</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec-header">Subsystem Intelligence Map</div>', unsafe_allow_html=True)
     st.caption(
-        "MatIntel does not assume one dataset covers every subsystem. "
-        "Each source enters with domain, trust, and model eligibility."
+        "Trusted reference data auto-loads at startup. Counts distinguish tagged rows, "
+        "inferred reference coverage, and experimental training rows."
     )
 
-    reg_cols = st.columns(2)
-    reg_items = list(PUBLIC_DATASET_REGISTRY.items())
-    ref_summary = summarize_sources(st.session_state["public_reference_rows"])
-    for idx, (key, info) in enumerate(reg_items):
-        with reg_cols[idx % 2]:
-            card_class = "empty"
-            status = info.get("status", "optional")
-            if key == "matminer_steel_strength":
-                card_class, status = "active", f"active — {len(unified_base)} experimental rows"
-            elif key == "jarvis_dft_3d":
-                if n_jarvis > 0:
-                    card_class, status = "pending", f"active computed-reference — {n_jarvis} rows"
-                else:
-                    status = "optional — load below"
-            elif key == "matminer_matbench_extra":
-                mb_count = ref_summary.get("by_source", {})
-                mb_total = sum(v for k, v in mb_count.items() if str(k).startswith("matbench"))
-                if mb_total > 0:
-                    card_class, status = "pending", f"loaded — {mb_total} benchmark rows"
-                else:
-                    status = "optional — load below"
-            elif key == "engineer_reviewed_upload" and n_uploaded > 0:
-                card_class, status = "pending", f"active — {n_uploaded} uploaded rows"
-            elif key == "matminer_steel_strength":
-                card_class = "active"
-            _render_source_card(key, {**info, "status": status}, card_class)
-
-    st.markdown('<div class="sec-header">Trusted Public Data Load</div>', unsafe_allow_html=True)
-    st.caption("Load real trusted datasets to expand the material universe. Experimental steel is never mixed into computed models.")
-
-    lc1, lc2, lc3 = st.columns(3)
-    with lc1:
-        if st.button("Load fast demo set", help="JARVIS sample (500 rows) — steel is always loaded at startup"):
-            with st.spinner("Loading fast demo set (steel + JARVIS sample)…"):
-                ref_df, msgs = load_trusted_public_bundle(
-                    mode="fast",
-                    include_jarvis=True,
-                    include_matbench=False,
-                    matbench_light_only=True,
-                )
-            if ref_df.empty:
-                st.warning(" | ".join(msgs))
-            else:
+    jarvis_5000 = ref_meta.get("jarvis_5000", CACHE_JARVIS_5000.exists())
+    if not jarvis_5000 and n_jarvis <= 500:
+        st.markdown(
+            """<div class="callout-premium">
+            <strong>Broader trusted reference cache not built yet</strong><br>
+            <span style="font-size:0.85rem;color:#5A5A5A;">
+            A 500-row JARVIS sample may be loaded. Build the 5,000-row cache for the full default universe
+            (steel + JARVIS + cached Matbench).
+            </span></div>""",
+            unsafe_allow_html=True,
+        )
+        if st.button("Build 5,000-row trusted reference cache", key="build_5000_cache"):
+            with st.spinner("Building JARVIS 5,000-row cache (may take a few minutes)…"):
+                ref_df, msgs = build_jarvis_cache(target_rows=5000, timeout_seconds=300)
+                if CACHE_MATBENCH_COMBINED.exists():
+                    mb_df, _ = load_matminer_extra_datasets(require_cache=True, matbench_light_only=True)
+                    if not mb_df.empty:
+                        ref_df = pd.concat([ref_df, mb_df], ignore_index=True) if not ref_df.empty else mb_df
+            if not ref_df.empty:
                 st.session_state["public_reference_rows"] = ref_df
+                st.session_state["reference_load_meta"] = {
+                    "jarvis_cached": True,
+                    "jarvis_5000": CACHE_JARVIS_5000.exists(),
+                    "matbench_cached": CACHE_MATBENCH_COMBINED.exists(),
+                }
+                st.session_state["reference_load_messages"] = msgs
                 st.success(" | ".join(msgs))
                 st.rerun()
-    with lc2:
-        if st.button(
-            "Load broader reference set",
-            help="Larger JARVIS sample (5000 rows) + matbench extras from cache if available",
-        ):
-            with st.spinner("Loading broader reference bundle…"):
-                ref_df, msgs = load_trusted_public_bundle(
-                    mode="broad",
-                    include_jarvis=True,
-                    include_matbench=True,
-                    matbench_light_only=True,
-                )
-            if ref_df.empty:
+            else:
                 st.warning(" | ".join(msgs))
-            else:
-                st.session_state["public_reference_rows"] = ref_df
-                st.success(" | ".join(msgs))
-                st.rerun()
-    with lc3:
-        st.caption("⚠ Can take several minutes due to pymatgen Structure decoding.")
-        if st.button(
-            "Load matbench extras",
-            help="Decode matbench datasets live via matminer — slow; use when expanding reference models",
-        ):
-            with st.spinner("Loading matbench extras (structure decoding — may take time)…"):
-                mb_df, mmsg = load_matminer_extra_datasets(
-                    max_rows_per_dataset=500,
-                    require_cache=False,
-                    matbench_light_only=False,
-                    timeout_seconds=300,
-                )
-                existing = st.session_state.get("public_reference_rows", pd.DataFrame())
-                if not existing.empty and "source_dataset" in existing.columns:
-                    keep = existing[
-                        ~existing["source_dataset"].astype(str).str.startswith("matbench")
-                    ]
-                else:
-                    keep = pd.DataFrame()
-                parts_ref = [f for f in [keep, mb_df] if not f.empty]
-                ref_df = pd.concat(parts_ref, ignore_index=True) if parts_ref else pd.DataFrame()
-            if ref_df.empty:
-                st.warning(mmsg)
-            else:
-                st.session_state["public_reference_rows"] = ref_df
-                st.success(mmsg)
-                st.rerun()
 
     if n_public_ref > 0:
-        src_counts = unified["source_dataset"].value_counts().to_dict() if "source_dataset" in unified.columns else {}
-        st.info(f"Public reference loaded: **{n_public_ref}** rows · Sources: {src_counts}")
-        if n_jarvis > 0:
-            cov = jarvis_property_coverage(unified)
-            cov_str = ", ".join(f"{k}: {v}" for k, v in cov.items() if v > 0)
-            st.caption(
-                f"JARVIS active computed-reference source · Property coverage: {cov_str or 'loading…'} · "
-                "Supports: General Material Reuse, Electronics / Thermal Interface, "
-                "Battery / Underbody reference, Structural reference"
-            )
+        auto_msgs = st.session_state.get("reference_load_messages", [])
+        tier = "5,000-row" if jarvis_5000 else "500-row sample"
+        load_note = f"{n_public_ref} reference records auto-loaded ({tier} JARVIS"
+        if n_matbench:
+            load_note += f" + {n_matbench} matbench cached"
+        load_note += ")"
+        if auto_msgs:
+            st.caption(f"✓ {load_note}")
 
-    st.markdown('<div class="sec-header">Evidence Coverage by Subsystem</div>', unsafe_allow_html=True)
-    coverage_dash = subsystem_evidence_dashboard(unified, registry_df)
-    st.dataframe(
-        coverage_dash[[
-            "subsystem", "materials", "fields_available", "fields_missing",
-            "active_models", "waiting_models", "readiness",
-        ]],
-        use_container_width=True, hide_index=True,
+    card_rows = [subsystem_cards[i : i + 4] for i in range(0, len(subsystem_cards), 4)]
+    for row_cards in card_rows:
+        cols = st.columns(4)
+        for col, card in zip(cols, row_cards):
+            with col:
+                st.markdown(render_subsystem_card_html(card), unsafe_allow_html=True)
+
+    st.markdown('<div class="sec-header">Evidence Sources → Subsystems → Models &amp; Decisions</div>', unsafe_allow_html=True)
+    st.markdown(
+        render_evidence_flow_html(
+            unified, registry_df, n_jarvis, n_matbench, n_uploaded, len(unified_base),
+        ),
+        unsafe_allow_html=True,
     )
 
-    with st.expander("Property Coverage Matrix"):
-        matrix = property_coverage_matrix(unified)
-        st.dataframe(matrix, use_container_width=True)
-        st.caption("Cell values = count of measured (non-assumption) property values for materials tagged to that subsystem.")
+    st.markdown('<div class="sec-header">Source-to-Subsystem Coverage</div>', unsafe_allow_html=True)
+    coverage_table = build_coverage_table(unified)
+    st.dataframe(coverage_table, use_container_width=True, hide_index=True)
+    st.caption(
+        "Tagged = explicit application_subsystem. Inferred = property-matched reference rows "
+        "(not hard-tagged). Training = experimental ML-eligible rows."
+    )
 
-    # JARVIS loader replaced by Trusted Public Data Load panel above
+    # ── Guided upload center ──
+    st.markdown('<div class="sec-header">Upload Reviewed Evidence Source</div>', unsafe_allow_html=True)
+    st.markdown(UPLOAD_GUIDELINES)
 
-    with st.expander("Raw matminer data preview"):
-        st.dataframe(raw.head(30), use_container_width=True)
+    with st.expander("Subsystem column guidance", expanded=False):
+        for sub, cols in SUBSYSTEM_COLUMN_GUIDANCE.items():
+            st.markdown(f"**{sub}:** `{cols}`")
 
-    with st.expander("Unified schema preview"):
-        preview_cols = [
-            "material_id", "material_name", "material_family", "application_subsystem",
-            "yield_strength_mpa", "density_g_cm3", "source_type", "source_trust_score",
-            "used_for_ml_training", "data_completeness_score",
-        ]
-        available_preview = [c for c in preview_cols if c in unified.columns]
-        st.dataframe(unified[available_preview].head(20), use_container_width=True)
+    # Templates
+    st.markdown("**Download CSV templates** (headers + example row marked EXAMPLE_DO_NOT_INGEST)")
+    tmpl_cols = st.columns(4)
+    template_names = list(SUBSYSTEM_TEMPLATE_COLUMNS.keys())
+    for i, tname in enumerate(template_names):
+        with tmpl_cols[i % 4]:
+            st.download_button(
+                label=tname[:28] + ("…" if len(tname) > 28 else ""),
+                data=template_download_bytes(tname),
+                file_name=f"matintel_template_{tname.replace(' / ', '_').replace(' ', '_').lower()}.csv",
+                mime="text/csv",
+                key=f"dl_tmpl_{i}",
+            )
 
-    with st.expander("Engineering assumptions (steel defaults)"):
-        demo_present = [c for c in DEMO_ENRICHMENT_COLS if c in unified.columns]
-        quarantined = [c for c in QUARANTINED_DEMO_FIELDS if c in unified.columns]
-        st.caption(
-            f"Labelled defaults only: {', '.join(demo_present) or 'none'}. "
-            f"Quarantined to NaN (no fabricated values): {', '.join(quarantined) or 'none'}."
-        )
-        st.info(ASSUMPTION_NOTE)
-
-    # ── Evidence Upload ──
-    st.markdown('<div class="sec-header">Evidence Source Upload</div>', unsafe_allow_html=True)
-    st.caption("Deterministic, auditable schema mapping. No LLM used.")
-
-    uploaded_file = st.file_uploader("Upload material evidence (CSV)", type=["csv"], key="csv_upload")
+    uploaded_file = st.file_uploader("Upload reviewed evidence CSV", type=["csv"], key="csv_upload")
 
     if uploaded_file is not None:
         try:
@@ -615,57 +642,211 @@ with tab1:
 
         if upload_df is not None and not upload_df.empty:
             if len(upload_df) > MAX_UPLOAD_ROWS:
-                st.warning(f"CSV has {len(upload_df)} rows — truncated to {MAX_UPLOAD_ROWS} for performance.")
+                st.warning(f"Truncated to {MAX_UPLOAD_ROWS} rows.")
                 upload_df = upload_df.head(MAX_UPLOAD_ROWS)
 
-            with st.expander("Raw uploaded data", expanded=True):
-                st.dataframe(upload_df.head(15), use_container_width=True)
-
-            src_col, info_col = st.columns([1, 2])
-            with src_col:
+            st.markdown("#### Source classification")
+            sc1, sc2, sc3 = st.columns(3)
+            with sc1:
                 chosen_source_type = st.selectbox(
                     "Source type", ALL_SOURCE_TYPES,
                     index=ALL_SOURCE_TYPES.index("supplier_sheet"),
                     key="upload_src_type",
                 )
-            with info_col:
-                profile = SOURCE_TYPE_PROFILES[chosen_source_type]
-                st.caption(f"{profile['description']} — Trust: {profile['trust']}/100 · ML: {'Yes' if profile['ml_eligible'] else 'No'}")
+            with sc2:
+                subsystem_options = ["infer from file if present"] + ALL_SUBSYSTEMS
+                chosen_subsystem = st.selectbox(
+                    "Application subsystem", subsystem_options, key="upload_subsystem",
+                )
+            with sc3:
+                engineer_reviewed = st.checkbox("Engineer reviewed", key="upload_eng_reviewed")
 
-            mapping_df = suggest_schema_mapping(upload_df)
+            infer_sub = chosen_subsystem == "infer from file if present"
+            app_sub = None if infer_sub else chosen_subsystem
+            profile = SOURCE_TYPE_PROFILES[chosen_source_type]
 
-            with st.expander("Schema mapping detail", expanded=True):
-                st.dataframe(mapping_df, use_container_width=True, hide_index=True)
-                options = ["ignore"] + STANDARD_FIELDS
-                overrides: dict[str, str] = {}
-                upload_cols = list(upload_df.columns)
-                for i in range(0, len(upload_cols), 3):
-                    row_cols = st.columns(3)
-                    for j, col_name in enumerate(upload_cols[i:i+3]):
-                        suggested_row = mapping_df[mapping_df["uploaded_column"] == col_name]
-                        default = suggested_row["suggested_field"].values[0] if len(suggested_row) > 0 else "ignore"
-                        default_idx = options.index(default) if default in options else 0
-                        with row_cols[j]:
-                            overrides[col_name] = st.selectbox(col_name, options, index=default_idx, key=f"map_{col_name}")
+            mapping_df = enrich_mapping_with_units(upload_df, suggest_schema_mapping(upload_df))
+            needs_confirm = mapping_df[mapping_df["needs_confirmation"] == True]  # noqa: E712
 
-            temp_mapped = apply_schema_mapping(upload_df, overrides, source_type=chosen_source_type)
-            ml_assessment = assess_ml_eligibility(temp_mapped, chosen_source_type)
+            st.markdown("#### Schema mapping review")
+            options = ["ignore"] + STANDARD_FIELDS
+            overrides: dict[str, str] = {}
+            unit_factors: dict[str, float] = {}
+            confirmations: dict[str, bool] = st.session_state.get("upload_confirmations", {})
+
+            upload_cols = list(upload_df.columns)
+            for i in range(0, len(upload_cols), 3):
+                row_cols = st.columns(3)
+                for j, col_name in enumerate(upload_cols[i:i + 3]):
+                    suggested_row = mapping_df[mapping_df["uploaded_column"] == col_name]
+                    default = suggested_row["suggested_field"].values[0] if len(suggested_row) > 0 else "ignore"
+                    default_idx = options.index(default) if default in options else 0
+                    with row_cols[j]:
+                        overrides[col_name] = st.selectbox(
+                            col_name, options, index=default_idx, key=f"map_{col_name}",
+                        )
+
+            if not needs_confirm.empty:
+                st.markdown("#### Mapping Review & Questions — Needs confirmation")
+                st.dataframe(
+                    needs_confirm[[
+                        "uploaded_column", "suggested_field", "confidence",
+                        "detected_unit", "review_question",
+                    ]],
+                    use_container_width=True, hide_index=True,
+                )
+                for _, nrow in needs_confirm.iterrows():
+                    col = nrow["uploaded_column"]
+                    norm = col.lower().strip()
+                    if "density" in norm and nrow["suggested_field"] == "density_g_cm3":
+                        unit_choice = st.radio(
+                            f"Unit for '{col}'",
+                            DENSITY_UNIT_OPTIONS,
+                            key=f"unit_{col}",
+                            horizontal=True,
+                        )
+                        unit_factors[col] = 0.001 if "kg/m" in unit_choice else 1.0
+                    confirmations[col] = st.checkbox(
+                        f"Confirmed by engineer: {col} → {overrides.get(col, nrow['suggested_field'])}",
+                        key=f"confirm_{col}",
+                    )
+
+            engineer_notes = st.text_area(
+                "Engineer review notes (stored in source metadata)",
+                key="upload_eng_notes", placeholder="e.g. Supplier datasheet Rev 3, lab batch 2024-Q2",
+            )
+
+            temp_mapped = apply_schema_mapping(
+                upload_df, overrides, source_type=chosen_source_type,
+                application_subsystem=app_sub, infer_subsystem=infer_sub,
+                engineer_reviewed=engineer_reviewed,
+                unit_factors=unit_factors,
+            )
+            ml_assessment = compute_ml_eligibility(temp_mapped, chosen_source_type, engineer_reviewed)
 
             ac1, ac2, ac3, ac4 = st.columns(4)
             ac1.metric("Source Trust", f"{profile['trust']}/100")
             ac2.metric("Mapping Confidence", f"{mapping_df['confidence'].mean():.0f}%")
-            ac3.metric("ML Eligible", "Yes" if ml_assessment["eligible"] else "No")
-            ac4.metric("Engineer Reviewed", "Pending")
+            ac3.metric("ML Eligible (auto)", "Yes" if ml_assessment["eligible"] else "No")
+            ac4.metric("Engineer Reviewed", "Yes" if engineer_reviewed else "No")
+            st.caption(f"ML assessment: {ml_assessment['reason']}")
 
-            if not ml_assessment["eligible"]:
-                st.caption(f"ML: {ml_assessment['reason']}")
+            if chosen_source_type == "unknown":
+                st.warning("Unknown source type — confirm classification before ingest.")
 
-            if st.button("Ingest Evidence", type="primary"):
-                mapped = apply_schema_mapping(upload_df, overrides, source_type=chosen_source_type)
-                st.session_state["uploaded_rows"] = mapped
-                st.session_state["upload_source_type"] = chosen_source_type
-                st.success(f"Ingested {len(mapped)} rows (session only).")
-                st.rerun()
+            unresolved = critical_mappings_unresolved(mapping_df, overrides, confirmations)
+            if unresolved:
+                st.warning(f"Unresolved mappings need engineer confirmation: {', '.join(unresolved)}")
+
+            if st.button("Approve and ingest evidence", type="primary", key="approve_ingest"):
+                if chosen_source_type == "unknown" and not engineer_reviewed:
+                    st.error("Unknown source requires engineer review before ingest.")
+                elif unresolved:
+                    st.error("Confirm all flagged mappings before ingest.")
+                else:
+                    mapped, summary = ingest_approved_evidence(
+                        upload_df, overrides,
+                        source_type=chosen_source_type,
+                        application_subsystem=app_sub,
+                        infer_subsystem=infer_sub,
+                        engineer_reviewed=engineer_reviewed,
+                        mapping_notes=f"Confirmed mappings: {len(overrides)} columns",
+                        engineer_review_notes=engineer_notes,
+                        unit_factors=unit_factors,
+                    )
+                    st.session_state["uploaded_rows"] = pd.concat(
+                        [st.session_state["uploaded_rows"], mapped], ignore_index=True,
+                    ) if not st.session_state["uploaded_rows"].empty else mapped
+                    st.session_state["last_ingest_summary"] = summary
+                    st.session_state["upload_confirmations"] = confirmations
+                    st.success(f"Ingested {summary['rows_ingested']} rows · ML eligible: {summary['ml_eligible_rows']}")
+                    st.rerun()
+
+    if st.session_state.get("last_ingest_summary"):
+        s = st.session_state["last_ingest_summary"]
+        st.markdown("#### Last ingestion result")
+        st.json(s)
+
+    # ── Below the fold: optional loaders & diagnostics ──
+    with st.expander("Optional reference cache controls (advanced)", expanded=False):
+        st.caption("Not required for demo — startup auto-loads from disk cache.")
+        lc1, lc2, lc3, lc4 = st.columns(4)
+        with lc1:
+            if st.button("Build 5,000-row JARVIS cache", key="ref_build_5000"):
+                with st.spinner("Building…"):
+                    ref_df, msgs = build_jarvis_cache(target_rows=5000, timeout_seconds=300)
+                if not ref_df.empty:
+                    existing = st.session_state.get("public_reference_rows", pd.DataFrame())
+                    non_jarvis = existing[
+                        ~existing["source_dataset"].astype(str).str.startswith("jarvis")
+                    ] if not existing.empty and "source_dataset" in existing.columns else pd.DataFrame()
+                    combined = pd.concat([f for f in [ref_df, non_jarvis] if not f.empty], ignore_index=True)
+                    st.session_state["public_reference_rows"] = combined
+                    st.success(" | ".join(msgs))
+                    st.rerun()
+                else:
+                    st.warning(" | ".join(msgs))
+        with lc2:
+            if st.button("Load broader reference set", key="ref_broad"):
+                ref_df, msgs = load_trusted_public_bundle(
+                    mode="broad", include_jarvis=True, include_matbench=True, matbench_light_only=True,
+                )
+                if not ref_df.empty:
+                    st.session_state["public_reference_rows"] = ref_df
+                    st.success(" | ".join(msgs))
+                    st.rerun()
+        with lc3:
+            st.caption("⚠ Slow")
+            if st.button("Load matbench extras", key="ref_matbench"):
+                mb_df, mmsg = load_matminer_extra_datasets(
+                    matbench_light_only=False, timeout_seconds=300,
+                )
+                existing = st.session_state.get("public_reference_rows", pd.DataFrame())
+                keep = existing[
+                    ~existing["source_dataset"].astype(str).str.startswith("matbench")
+                ] if not existing.empty and "source_dataset" in existing.columns else pd.DataFrame()
+                parts = [f for f in [keep, mb_df] if not f.empty]
+                if parts:
+                    st.session_state["public_reference_rows"] = pd.concat(parts, ignore_index=True)
+                    st.success(mmsg)
+                    st.rerun()
+                else:
+                    st.warning(mmsg)
+        with lc4:
+            st.caption("⚠ Very slow")
+            if st.button("Load full JARVIS", key="ref_full_jarvis"):
+                jarvis_df, jmsg = load_jarvis_dft(max_rows=None, cache=True)
+                existing = st.session_state.get("public_reference_rows", pd.DataFrame())
+                non_jarvis = existing[
+                    ~existing["source_dataset"].astype(str).str.startswith("jarvis")
+                ] if not existing.empty and "source_dataset" in existing.columns else pd.DataFrame()
+                parts = [f for f in [jarvis_df, non_jarvis] if not f.empty]
+                if parts:
+                    st.session_state["public_reference_rows"] = pd.concat(parts, ignore_index=True)
+                    st.success(jmsg)
+                    st.rerun()
+
+    with st.expander("Dataset registry & diagnostics", expanded=False):
+        reg_cols = st.columns(2)
+        ref_summary = summarize_sources(st.session_state["public_reference_rows"])
+        for idx, (key, info) in enumerate(PUBLIC_DATASET_REGISTRY.items()):
+            with reg_cols[idx % 2]:
+                card_class = "empty"
+                status = info.get("status", "optional")
+                if key == "matminer_steel_strength":
+                    card_class, status = "active", f"active — {len(unified_base)} experimental rows"
+                elif key == "jarvis_dft_3d" and n_jarvis > 0:
+                    card_class, status = "pending", f"auto-loaded — {n_jarvis} rows"
+                elif key == "matminer_matbench_extra" and n_matbench > 0:
+                    card_class, status = "pending", f"cached — {n_matbench} rows"
+                elif key == "engineer_reviewed_upload" and n_uploaded > 0:
+                    card_class, status = "pending", f"active — {n_uploaded} uploaded rows"
+                _render_source_card(key, {**info, "status": status}, card_class)
+
+        coverage_dash = subsystem_evidence_dashboard(unified, registry_df)
+        st.dataframe(coverage_dash, use_container_width=True, hide_index=True)
+        st.dataframe(property_coverage_matrix(unified), use_container_width=True)
+        st.info(ASSUMPTION_NOTE)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -763,130 +944,146 @@ with tab2:
 # ═════════════════════════════════════════════════════════════════════════════
 
 with tab3:
-    st.markdown('<div class="sec-header">Model Registry</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec-header">Property-Specific Model Registry</div>', unsafe_allow_html=True)
+    st.caption(
+        "MatIntel trains one model per target/property — not a single universal model across all 8,312 records. "
+        "All rows remain available for passport, search, and scoring."
+    )
 
-    active_df = registry_df[registry_df["status"] == "Active"]
+    active_df = registry_df[registry_df["status"].isin(["Active", "Active computed-reference"])]
     trainable_df = registry_df[registry_df["status"].isin([
         "Trainable", "Trainable next", "Computed-reference trainable",
     ])]
     waiting_df = registry_df[registry_df["status"].isin(["Waiting for evidence", "Insufficient data"])]
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Active", len(active_df))
-    m2.metric("Trainable next", len(trainable_df))
-    m3.metric("Waiting", len(waiting_df))
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Active trained", len(all_models))
+    m2.metric("Experimental", hero["experimental_trained_models"])
+    m3.metric("Computed-reference", hero["computed_reference_trained_models"])
+    m4.metric("Waiting", len(waiting_df))
 
     st.dataframe(
-        registry_df[["model_name", "subsystem", "target", "eligible_rows", "status", "reason"]],
+        registry_df[[
+            "model_name", "subsystem", "target", "eligible_rows",
+            "status", "model_family", "reason",
+        ]],
         use_container_width=True, hide_index=True,
     )
 
-    model_options = list(MODEL_SPECS.keys())
-    status_map = dict(zip(registry_df["model_name"], registry_df["status"]))
-    model_labels = [f"{m} — {status_map.get(m, 'Unknown')}" for m in model_options]
-    selected_model_idx = st.selectbox("Select model", range(len(model_options)),
-                                        format_func=lambda i: model_labels[i], key="pred_model_select")
-    selected_model = model_options[selected_model_idx]
-    model_status = status_map.get(selected_model, "Unknown")
-    activation = get_model_activation_info(selected_model, registry_df)
+    st.markdown('<div class="sec-header">Active Trained Models</div>', unsafe_allow_html=True)
 
-    st.caption(
-        "Current active experimental model is trained on structural steel data. "
-        "Waiting models need eligible labelled evidence — not errors."
-    )
-
-    if model_status == "Active" and selected_model == "structural_yield_strength":
-        st.markdown('<div class="sec-header">Property Prediction — Yield Strength</div>', unsafe_allow_html=True)
-        interval_label = model_bundle.get("interval_method", "tree_spread")
-        st.caption(
-            f"Best selected model: **{MODEL_ALGO}** · R² {M['R2']} · MAE {M['MAE']} MPa · "
-            f"{M['train_rows']} training rows · Interval: {interval_label}"
+    if not all_models:
+        st.warning(
+            "No trained models on disk. Run `python scripts/bootstrap_data.py` to train "
+            "structural and computed-reference models."
         )
-
-        pred_candidates = unified[unified["yield_strength_mpa"].notna()]["material_id"].tolist()
-        if not pred_candidates:
-            st.warning("No materials with yield strength data available for prediction.")
-        else:
-            material_id = st.selectbox("Select material", pred_candidates, key="pred_material")
-            row = unified[unified["material_id"] == material_id].iloc[0]
-
-            comp_cols = [c for c in row.index if c.startswith("wt_percent_") and pd.notna(row[c])]
-            if comp_cols:
-                with st.expander("Composition (wt%)", expanded=True):
-                    comp_data = {c.replace("wt_percent_", "").upper(): round(row[c], 3) for c in comp_cols}
-                    st.dataframe(pd.DataFrame([comp_data]), use_container_width=True, hide_index=True)
-
-            pred_info = predict_with_interval(model_bundle, row)
-            conf = confidence_score(row, pred_info, model_bundle)
-
-            pm1, pm2, pm3, pm4 = st.columns(4)
-            pm1.metric("Predicted", f"{pred_info['prediction']} MPa")
-            if pred_info["actual"] is not None:
-                delta = round(pred_info["prediction"] - pred_info["actual"], 1)
-                pm2.metric("Actual", f"{pred_info['actual']} MPa", delta=f"{delta:+} error")
-            else:
-                pm2.metric("Actual", "—")
-            pm3.metric("Prediction Confidence", f"{conf['confidence']}%")
-            pm4.metric("Risk", conf["risk"])
-
-            fig_iv = go.Figure()
-            fig_iv.add_trace(go.Bar(
-                x=[""], y=[pred_info["upper"] - pred_info["lower"]],
-                base=[pred_info["lower"]],
-                name="80% interval", marker_color="rgba(27,67,50,0.15)", width=0.3,
-            ))
-            fig_iv.add_trace(go.Scatter(
-                x=[""], y=[pred_info["prediction"]],
-                mode="markers", marker=dict(size=14, color="#1B4332"), name="Predicted",
-            ))
-            if pred_info["actual"] is not None:
-                fig_iv.add_trace(go.Scatter(
-                    x=[""], y=[pred_info["actual"]],
-                    mode="markers", marker=dict(size=12, color="#B08D57", symbol="diamond"), name="Actual",
-                ))
-            fig_iv.update_layout(
-                yaxis_title="Yield Strength (MPa)", height=260,
-                showlegend=True, margin=dict(l=40, r=40, t=20, b=20),
-                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                legend=dict(orientation="h", y=-0.15),
-            )
-            st.plotly_chart(fig_iv, use_container_width=True)
-
-            st.markdown('<div class="sec-header">Confidence Breakdown</div>', unsafe_allow_html=True)
-            for label, val, mx in [
-                ("Uncertainty", conf["uncertainty_penalty"], 30),
-                ("Missing Data", conf["missing_data_penalty"], 18),
-                ("Source Trust", conf["source_risk_penalty"], 25),
-                ("Out-of-Distribution", conf["out_of_distribution_penalty"], 25),
-            ]:
-                st.progress(min(val / max(mx, 1), 1.0), text=f"{label}: −{val} pts")
-
-            with st.expander("Material Passport"):
-                render_passport_for_subsystem(row, "Structural / Chassis")
-
-            with st.expander("Model and uncertainty method"):
-                st.markdown(
-                    f"- **Best selected model:** {MODEL_ALGO} (chosen by lowest test RMSE)\n"
-                    f"- **Interval method:** {pred_info.get('interval_method', interval_label)}\n"
-                    "- **Prediction confidence** (`prediction_confidence_score`) starts at 100% "
-                    "and is reduced by uncertainty, missing fields, source trust, and OOD risk.\n"
-                    "- Source trust uses `source_trust_score` separately from prediction confidence."
-                )
     else:
-        st.markdown('<div class="sec-header">Waiting for Eligible Evidence</div>', unsafe_allow_html=True)
-        st.markdown(
-            f"""<div class="empty-state">
-            <h3>{esc(selected_model)} — {esc(model_status)}</h3>
-            <p><strong>Target property:</strong> {esc(activation['target'])}</p>
-            <p><strong>Subsystem:</strong> {esc(activation['subsystem'])}</p>
-            <p><strong>Required features:</strong> {esc(activation['required_features'])}</p>
-            <p><strong>Eligible source types:</strong> {esc(activation['eligible_source_types'])}</p>
-            <p><strong>Current eligible rows:</strong> {activation['eligible_rows']}</p>
-            <p><strong>Why not active:</strong> {esc(activation['reason'])}</p>
-            <p><strong>How to activate:</strong> {esc(activation['how_to_activate'])}</p>
-            </div>""",
-            unsafe_allow_html=True,
-        )
+        for model_key, bundle in all_models.items():
+            spec = MODEL_SPECS.get(model_key, {})
+            family = bundle.get("model_family", spec.get("model_family", "experimental"))
+            is_computed = family == "computed_reference"
+            limitation = bundle.get(
+                "limitation_label",
+                "Computed-reference screening model — validation required before engineering release"
+                if is_computed else "Measured-data prediction",
+            )
+            unit = bundle.get("unit", "MPa" if model_key == "structural_yield_strength" else "")
+            algo = bundle.get("selected_algorithm", bundle.get("model_name", "—"))
+            metrics = bundle.get("metrics", {})
+            target_col = bundle.get("target", spec.get("target", ""))
+            sources = ", ".join(bundle.get("source_datasets", [])) or "—"
+
+            st.markdown(
+                f"""<div class="passport" style="margin-bottom:16px;">
+                <div class="passport-header">{esc(model_key.replace('_', ' ').title())}</div>
+                <table>
+                <tr><td>Target</td><td>{esc(target_col)}</td></tr>
+                <tr><td>Model family</td><td>{esc(family.replace('_', ' '))}</td></tr>
+                <tr><td>Source basis</td><td>{esc(sources)}</td></tr>
+                <tr><td>Rows used</td><td>{bundle.get('rows', metrics.get('train_rows', '—'))}</td></tr>
+                <tr><td>Algorithm</td><td>{esc(algo)}</td></tr>
+                <tr><td>R² / MAE / RMSE</td><td>{metrics.get('R2', '—')} / {metrics.get('MAE', '—')} / {metrics.get('RMSE', '—')}</td></tr>
+                <tr><td>Limitation</td><td>{esc(limitation)}</td></tr>
+                </table></div>""",
+                unsafe_allow_html=True,
+            )
+
+            test_actuals = bundle.get("test_actuals", [])
+            test_preds = bundle.get("test_predictions", [])
+            if test_actuals and test_preds:
+                fig_sc = go.Figure()
+                fig_sc.add_trace(go.Scatter(
+                    x=test_actuals, y=test_preds,
+                    mode="markers", marker=dict(size=7, color="#1B4332", opacity=0.65),
+                    name="Test holdout",
+                ))
+                lo = min(min(test_actuals), min(test_preds))
+                hi = max(max(test_actuals), max(test_preds))
+                fig_sc.add_trace(go.Scatter(
+                    x=[lo, hi], y=[lo, hi],
+                    mode="lines", line=dict(dash="dash", color="#B08D57"),
+                    name="Perfect prediction",
+                ))
+                fig_sc.update_layout(
+                    title=f"Actual vs Predicted — {target_col}",
+                    xaxis_title=f"Actual ({unit})".strip(),
+                    yaxis_title=f"Predicted ({unit})".strip(),
+                    height=320, margin=dict(l=40, r=20, t=40, b=40),
+                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                )
+                st.plotly_chart(fig_sc, use_container_width=True, key=f"scatter_{model_key}")
+
+            importance = bundle.get("feature_importance", {})
+            if importance:
+                imp_df = pd.DataFrame([
+                    {"feature": k, "importance": v}
+                    for k, v in sorted(importance.items(), key=lambda x: -x[1])[:10]
+                ])
+                fig_imp = px.bar(
+                    imp_df, x="importance", y="feature", orientation="h",
+                    title="Top feature importance",
+                    color_discrete_sequence=["#2D6A4F"],
+                )
+                fig_imp.update_layout(
+                    height=280, margin=dict(l=20, r=20, t=40, b=20),
+                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                )
+                st.plotly_chart(fig_imp, use_container_width=True, key=f"imp_{model_key}")
+
+            # Interactive prediction for this model
+            if target_col in unified.columns:
+                candidates = unified[unified[target_col].notna()]["material_id"].tolist()
+                if candidates:
+                    mat_id = st.selectbox(
+                        f"Inspect material — {model_key}",
+                        candidates[:500],
+                        key=f"pred_mat_{model_key}",
+                    )
+                    row = unified[unified["material_id"] == mat_id].iloc[0]
+                    pred_info = predict_with_interval(bundle, row)
+                    conf = confidence_score(row, pred_info, bundle)
+                    pc1, pc2, pc3 = st.columns(3)
+                    pc1.metric("Predicted", f"{pred_info['prediction']} {unit}".strip())
+                    if pred_info["actual"] is not None:
+                        pc2.metric("Actual", f"{pred_info['actual']} {unit}".strip())
+                    else:
+                        pc2.metric("Actual", "—")
+                    pc3.metric("Prediction confidence", f"{conf['confidence']}%")
+            st.divider()
+
+    st.markdown('<div class="sec-header">Models Waiting for Evidence</div>', unsafe_allow_html=True)
+    if waiting_df.empty:
+        st.caption("No models currently waiting.")
+    else:
+        for _, wrow in waiting_df.iterrows():
+            activation = get_model_activation_info(wrow["model_name"], registry_df)
+            st.markdown(
+                f"""<div class="empty-state" style="padding:14px;">
+                <p><strong>{esc(wrow['model_name'])}</strong> — {esc(wrow['status'])}</p>
+                <p>{esc(activation['how_to_activate'])}</p>
+                </div>""",
+                unsafe_allow_html=True,
+            )
 
 
 # ═════════════════════════════════════════════════════════════════════════════

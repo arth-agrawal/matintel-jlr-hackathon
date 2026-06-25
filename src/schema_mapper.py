@@ -238,7 +238,13 @@ def assess_ml_eligibility(mapped_df: pd.DataFrame, source_type: str) -> dict:
 
 def apply_schema_mapping(
     uploaded_df: pd.DataFrame, mapping_dict: dict[str, str],
-    source_label: str = "uploaded_supplier_sheet", source_type: str = "supplier_sheet",
+    source_label: str = "engineer_reviewed_upload", source_type: str = "supplier_sheet",
+    application_subsystem: str | None = None,
+    infer_subsystem: bool = False,
+    engineer_reviewed: bool = False,
+    mapping_notes: str = "",
+    engineer_review_notes: str = "",
+    unit_factors: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     profile = SOURCE_TYPE_PROFILES.get(source_type, SOURCE_TYPE_PROFILES["unknown"])
     out = pd.DataFrame()
@@ -250,19 +256,41 @@ def apply_schema_mapping(
     out["source_trust_score"] = profile["trust"]
     out["used_for_ml_training"] = False
     out["model_registry_eligible"] = profile["ml_eligible"]
-    out["engineer_reviewed"] = False
+    out["engineer_reviewed"] = engineer_reviewed
     out["recommendation_basis"] = "upload-evidence based screening"
+
+    if application_subsystem and not infer_subsystem:
+        out["application_subsystem"] = application_subsystem
+    elif infer_subsystem and "application_subsystem" in mapping_dict.values():
+        pass  # mapped from file column below
+    elif application_subsystem:
+        out["application_subsystem"] = application_subsystem
+
+    notes_parts = []
+    if mapping_notes:
+        notes_parts.append(f"Mapping: {mapping_notes}")
+    if engineer_review_notes:
+        notes_parts.append(f"Engineer notes: {engineer_review_notes}")
+    if engineer_reviewed:
+        notes_parts.append("Engineer reviewed at ingest.")
 
     for upload_col, std_field in mapping_dict.items():
         if std_field == "ignore" or std_field not in STANDARD_FIELDS:
             continue
         if upload_col not in uploaded_df.columns:
             continue
-        factor = _detect_unit_conversion(upload_col, std_field)
+        factor = (unit_factors or {}).get(upload_col, _detect_unit_conversion(upload_col, std_field))
         values = uploaded_df[upload_col]
         if factor != 1.0:
             values = pd.to_numeric(values, errors="coerce") * factor
+            notes_parts.append(f"Unit conversion {upload_col} ×{factor}")
         out[std_field] = values
+
+    if infer_subsystem and "application_subsystem" not in out.columns:
+        if "application_subsystem" in uploaded_df.columns:
+            out["application_subsystem"] = uploaded_df["application_subsystem"].values
+        elif application_subsystem:
+            out["application_subsystem"] = application_subsystem
 
     for sf in STANDARD_FIELDS:
         if sf not in out.columns:
@@ -279,5 +307,12 @@ def apply_schema_mapping(
         out["data_completeness_score"] = (100 * (1 - out[present].isna().mean(axis=1))).round(1)
     else:
         out["data_completeness_score"] = 0.0
+
+    if notes_parts:
+        existing = out.get("notes", pd.Series([""] * n))
+        out["notes"] = existing.astype(str) + " | ".join(notes_parts)
+
+    if engineer_reviewed and mapping_notes:
+        out["data_assumption_notes"] = mapping_notes
 
     return out

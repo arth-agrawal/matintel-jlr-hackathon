@@ -15,7 +15,11 @@ import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
-CACHE_JARVIS = RAW_DIR / "jarvis_dft_3d.csv"
+CACHE_JARVIS_500 = RAW_DIR / "jarvis_dft_3d_500.csv"
+CACHE_JARVIS_5000 = RAW_DIR / "jarvis_dft_3d_5000.csv"
+CACHE_JARVIS_FULL = RAW_DIR / "jarvis_dft_3d_full.csv"
+# Legacy alias — prefer tiered caches
+CACHE_JARVIS = CACHE_JARVIS_500
 CACHE_MATBENCH_COMBINED = RAW_DIR / "matminer_extra_combined.csv"
 CACHE_MATBENCH_DIR = RAW_DIR / "matbench_cache"
 CACHE_MATMINER_META = RAW_DIR / "matminer_extra_meta.json"
@@ -265,32 +269,80 @@ def _map_jarvis_entry(entry: dict, idx: int) -> dict:
     return row
 
 
-def load_jarvis_dft(max_rows: int | None = 500, cache: bool = True) -> tuple[pd.DataFrame, str]:
-    """Load JARVIS-DFT dft_3d with optional disk cache."""
-    if cache and CACHE_JARVIS.exists() and max_rows is not None:
+def _jarvis_cache_path(max_rows: int | None) -> Path:
+    if max_rows is None:
+        return CACHE_JARVIS_FULL
+    if max_rows <= 500:
+        return CACHE_JARVIS_500
+    if max_rows <= 5000:
+        return CACHE_JARVIS_5000
+    return CACHE_JARVIS_FULL
+
+
+def _migrate_legacy_jarvis_cache() -> None:
+    """Copy legacy jarvis_dft_3d.csv into tiered cache if needed."""
+    legacy = RAW_DIR / "jarvis_dft_3d.csv"
+    if legacy.exists() and not CACHE_JARVIS_500.exists():
         try:
-            cached = pd.read_csv(CACHE_JARVIS)
-            if len(cached) >= max_rows:
-                return cached.head(max_rows).copy(), f"Loaded {min(max_rows, len(cached))} JARVIS rows from cache."
+            df = pd.read_csv(legacy)
+            RAW_DIR.mkdir(parents=True, exist_ok=True)
+            df.head(500).to_csv(CACHE_JARVIS_500, index=False)
+            if len(df) >= 5000:
+                df.head(5000).to_csv(CACHE_JARVIS_5000, index=False)
+            elif len(df) > 500:
+                df.to_csv(CACHE_JARVIS_5000, index=False)
         except Exception:
             pass
+
+
+def load_jarvis_dft(max_rows: int | None = 500, cache: bool = True) -> tuple[pd.DataFrame, str]:
+    """Load JARVIS-DFT dft_3d with tiered disk cache (500 / 5000 / full)."""
+    _migrate_legacy_jarvis_cache()
+    cache_path = _jarvis_cache_path(max_rows)
+
+    if cache and cache_path.exists():
+        try:
+            cached = pd.read_csv(cache_path)
+            if max_rows is not None and len(cached) >= max_rows:
+                n = min(max_rows, len(cached))
+                return cached.head(n).copy(), f"Loaded {n} JARVIS rows from cache ({cache_path.name})."
+            if max_rows is None:
+                return cached.copy(), f"Loaded {len(cached)} JARVIS rows from cache ({cache_path.name})."
+        except Exception:
+            pass
+
+    # Fall back to smaller tier cache if larger missing
+    if cache and max_rows is not None and max_rows > 500:
+        for fallback_path, fallback_n in [(CACHE_JARVIS_5000, 5000), (CACHE_JARVIS_500, 500)]:
+            if fallback_path.exists() and fallback_n <= (max_rows or fallback_n):
+                try:
+                    cached = pd.read_csv(fallback_path)
+                    n = min(max_rows, len(cached))
+                    return (
+                        cached.head(n).copy(),
+                        f"Loaded {n} JARVIS rows from {fallback_path.name} (target cache {cache_path.name} not built yet).",
+                    )
+                except Exception:
+                    continue
 
     try:
         from jarvis.db.figshare import data as jdata
     except ImportError:
-        if cache and CACHE_JARVIS.exists():
-            cached = pd.read_csv(CACHE_JARVIS)
-            n = len(cached) if max_rows is None else min(max_rows, len(cached))
-            return cached.head(n).copy(), f"jarvis-tools unavailable — loaded {n} rows from cache."
+        for fallback_path in (cache_path, CACHE_JARVIS_5000, CACHE_JARVIS_500, RAW_DIR / "jarvis_dft_3d.csv"):
+            if fallback_path.exists():
+                cached = pd.read_csv(fallback_path)
+                n = len(cached) if max_rows is None else min(max_rows, len(cached))
+                return cached.head(n).copy(), f"jarvis-tools unavailable — loaded {n} rows from {fallback_path.name}."
         return pd.DataFrame(), "jarvis-tools not installed. Run: pip install jarvis-tools"
 
     try:
         raw = jdata("dft_3d")
     except Exception as e:
-        if cache and CACHE_JARVIS.exists():
-            cached = pd.read_csv(CACHE_JARVIS)
-            n = len(cached) if max_rows is None else min(max_rows, len(cached))
-            return cached.head(n).copy(), f"JARVIS download failed ({e}) — using {n} cached rows."
+        for fallback_path in (cache_path, CACHE_JARVIS_5000, CACHE_JARVIS_500):
+            if fallback_path.exists():
+                cached = pd.read_csv(fallback_path)
+                n = len(cached) if max_rows is None else min(max_rows, len(cached))
+                return cached.head(n).copy(), f"JARVIS download failed ({e}) — using {n} rows from {fallback_path.name}."
         return pd.DataFrame(), f"JARVIS data download failed: {e}"
 
     if not raw:
@@ -305,9 +357,14 @@ def load_jarvis_dft(max_rows: int | None = 500, cache: bool = True) -> tuple[pd.
 
     if cache and not df.empty:
         RAW_DIR.mkdir(parents=True, exist_ok=True)
-        df.to_csv(CACHE_JARVIS, index=False)
+        df.to_csv(cache_path, index=False)
+        # Also refresh 500 sample from same download when building larger tiers
+        if max_rows is not None and max_rows >= 500:
+            df.head(500).to_csv(CACHE_JARVIS_500, index=False)
+        if max_rows is not None and max_rows >= 5000:
+            df.head(5000).to_csv(CACHE_JARVIS_5000, index=False)
 
-    return df, f"Loaded {len(df)} JARVIS-DFT rows (computed reference)."
+    return df, f"Loaded {len(df)} JARVIS-DFT rows (computed reference) → saved {cache_path.name}."
 
 
 def load_jarvis_dft_sample(max_rows: int = 500) -> tuple[pd.DataFrame, str]:
@@ -530,7 +587,7 @@ def load_trusted_public_bundle(
     frames: list[pd.DataFrame] = []
 
     if mode == "fast":
-        jarvis_n = 500
+        jarvis_n = 5000
         matbench_n = 500
     elif mode == "broad":
         jarvis_n = 5000
@@ -574,6 +631,144 @@ def load_trusted_public_bundle(
 
     combined = pd.concat(frames, ignore_index=True)
     return combined, messages
+
+
+def build_jarvis_cache(
+    max_rows: int | None = 5000,
+    force_refresh: bool = False,
+    *,
+    target_rows: int | None = None,
+    timeout_seconds: int = 300,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Build or refresh a tiered JARVIS disk cache (500 / 5000 / full).
+
+    Returns (dataframe, messages). Never raises — returns empty df + message on failure.
+    Accepts ``target_rows`` / ``timeout_seconds`` for backward compatibility with app.py.
+    """
+    _migrate_legacy_jarvis_cache()
+    rows = target_rows if target_rows is not None else max_rows
+    cache_path = _jarvis_cache_path(rows)
+    messages: list[str] = []
+
+    if not force_refresh and cache_path.exists():
+        try:
+            cached = pd.read_csv(cache_path)
+            if rows is None:
+                n = len(cached)
+            else:
+                n = min(rows, len(cached))
+            df = cached.head(n).copy() if rows is not None else cached.copy()
+            messages.append(f"Loaded {len(df)} JARVIS rows from cache ({cache_path.name}).")
+            return df, messages
+        except Exception as exc:
+            messages.append(f"Could not read {cache_path.name}: {exc}. Rebuilding…")
+
+    def _download() -> tuple[pd.DataFrame, str]:
+        return load_jarvis_dft(max_rows=rows, cache=True)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_download)
+        try:
+            df, msg = future.result(timeout=timeout_seconds)
+            messages.append(msg)
+            if not df.empty:
+                return df, messages
+            messages.append("JARVIS loader returned no rows.")
+        except concurrent.futures.TimeoutError:
+            messages.append(f"JARVIS build timed out after {timeout_seconds}s.")
+        except Exception as exc:
+            messages.append(f"JARVIS build failed: {exc}")
+
+    # Fallback to any available tier cache
+    for fallback_path in (cache_path, CACHE_JARVIS_5000, CACHE_JARVIS_500, RAW_DIR / "jarvis_dft_3d.csv"):
+        if fallback_path.exists():
+            try:
+                cached = pd.read_csv(fallback_path)
+                n = len(cached) if rows is None else min(rows or len(cached), len(cached))
+                messages.append(
+                    f"Using {n} rows from {fallback_path.name} (jarvis-tools/network may be unavailable)."
+                )
+                return cached.head(n).copy(), messages
+            except Exception:
+                continue
+
+    messages.append(
+        "JARVIS cache unavailable. Install jarvis-tools and ensure network access, "
+        "or run `python scripts/bootstrap_data.py`."
+    )
+    return pd.DataFrame(), messages
+
+
+def build_default_reference_cache(
+    jarvis_rows: int = 5000,
+    include_matbench_cache: bool = True,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Bootstrap helper: JARVIS tier + optional matbench combined cache."""
+    messages: list[str] = []
+    frames: list[pd.DataFrame] = []
+
+    if CACHE_JARVIS_5000.exists() and jarvis_rows <= 5000:
+        jarvis_df, jarvis_msg = load_jarvis_dft(max_rows=jarvis_rows, cache=True)
+    else:
+        jarvis_df, jarvis_msgs = build_jarvis_cache(max_rows=jarvis_rows)
+        messages.extend(jarvis_msgs)
+        jarvis_msg = jarvis_msgs[-1] if jarvis_msgs else ""
+    if not jarvis_df.empty:
+        frames.append(jarvis_df)
+        if jarvis_msg and jarvis_msg not in messages:
+            messages.append(jarvis_msg)
+
+    if include_matbench_cache and CACHE_MATBENCH_COMBINED.exists():
+        mb_df, mb_msg = _load_matbench_from_combined_cache(500)
+        if not mb_df.empty:
+            frames.append(mb_df)
+            messages.append(mb_msg)
+
+    if not frames:
+        return pd.DataFrame(), messages or ["No reference cache could be built."]
+
+    return pd.concat(frames, ignore_index=True), messages
+
+
+def auto_load_trusted_reference(max_rows: int = 5000) -> tuple[pd.DataFrame, list[str]]:
+    """Fast cache-first startup: prefer 5000-row JARVIS + matbench combined cache."""
+    messages: list[str] = []
+    try:
+        _migrate_legacy_jarvis_cache()
+        frames: list[pd.DataFrame] = []
+
+        if CACHE_JARVIS_5000.exists():
+            jarvis_df, jarvis_msg = load_jarvis_dft(max_rows=min(max_rows, 5000), cache=True)
+            messages.append(jarvis_msg)
+        elif CACHE_JARVIS_500.exists():
+            jarvis_df, jarvis_msg = load_jarvis_dft(max_rows=500, cache=True)
+            messages.append(jarvis_msg)
+            messages.append(
+                "Fast 500-row JARVIS sample loaded. Build 5,000-row cache via bootstrap or Evidence Intake controls."
+            )
+        else:
+            messages.append(
+                "No JARVIS reference cache found. Steel data is still available. "
+                "Run `python scripts/bootstrap_data.py` to build the trusted reference cache."
+            )
+            jarvis_df = pd.DataFrame()
+
+        if not jarvis_df.empty:
+            frames.append(jarvis_df)
+
+        if CACHE_MATBENCH_COMBINED.exists():
+            mb_df, mb_msg = _load_matbench_from_combined_cache(500)
+            if not mb_df.empty:
+                frames.append(mb_df)
+                messages.append(mb_msg)
+
+        if not frames:
+            return pd.DataFrame(), messages
+
+        combined = pd.concat(frames, ignore_index=True)
+        return combined, messages
+    except Exception as exc:
+        return pd.DataFrame(), [f"auto_load_trusted_reference failed: {exc}"]
 
 
 def load_nasa_tpsx_csv(path: Path) -> tuple[pd.DataFrame, str]:
