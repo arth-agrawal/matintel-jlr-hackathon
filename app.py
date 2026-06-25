@@ -18,8 +18,10 @@ from src.data_pipeline import (
 from src.data_assumptions import format_field_display, is_assumption_field, ASSUMPTION_NOTE
 from src.modeling import (
     load_or_train_model, load_or_train_models, load_all_trained_models,
-    predict_with_interval, MODEL_TRAINING_SPECS,
+    predict_with_interval, MODEL_TRAINING_SPECS, train_property_model,
 )
+from src.demo_ui import MODEL_CARDS, display_status, SUBSYSTEM_UNLOCK
+from src.upload_model_update import assess_upload_model_impact, retrain_affected_model, detect_upload_targets
 from src.confidence import confidence_score
 from src.recommender import (
     recommend_materials, USE_CASE_PRESETS,
@@ -46,7 +48,7 @@ from src.upload_workflow import (
     critical_mappings_unresolved,
     ingest_approved_evidence, compute_ml_eligibility, DENSITY_UNIT_OPTIONS,
 )
-from src.model_registry import detect_trainable_targets, get_active_models, get_trainable_next_models, MODEL_SPECS
+from src.model_registry import detect_trainable_targets, get_active_models, get_trainable_next_models, MODEL_SPECS, get_trained_models_for_subsystem
 from src.subsystem_profiles import SUBSYSTEM_PROFILES, ALL_SUBSYSTEMS, get_subsystem_readiness
 from src.evidence_coverage import (
     filter_subsystem_rows, apply_subsystem_filters, format_display_table,
@@ -219,6 +221,8 @@ if "upload_confirmations" not in st.session_state:
     st.session_state["upload_confirmations"] = {}
 if "last_ingest_summary" not in st.session_state:
     st.session_state["last_ingest_summary"] = None
+if "pending_retrain" not in st.session_state:
+    st.session_state["pending_retrain"] = {}
 if "public_reference_rows" not in st.session_state:
     ref_df, ref_msgs = auto_load_trusted_reference()
     if ref_df.empty:
@@ -289,12 +293,11 @@ def _decision_status(row):
     completeness = row.get("data_completeness_score", 0)
     if completeness is None or (isinstance(completeness, float) and np.isnan(completeness)):
         completeness = 0
-    # Fatigue/corrosion are validation gates, not prerequisites
     if trust >= 80 and completeness >= 50:
-        return "Ready for validation", "pill-green"
+        return "Recommended for screening", "pill-green"
     elif trust >= 50 and completeness >= 30:
-        return "Needs review", "pill-amber"
-    return "Insufficient evidence", "pill-red"
+        return "Needs lab validation", "pill-amber"
+    return "Add supplier data to improve confidence", "pill-red"
 
 
 def render_material_passport(row, pred=None, conf=None):
@@ -346,14 +349,20 @@ def render_material_passport(row, pred=None, conf=None):
     <tr><td>Supplier Risk</td><td>{_fv_field(row, 'supplier_risk_score', '/100')}</td></tr>
     <tr><td>Critical Material Risk</td><td>{_fv_field(row, 'critical_material_risk_score', '/100')}</td></tr>
     <tr><td>ML Eligible</td><td>{'Yes' if ml_flag else 'No'}</td></tr>
-    <tr><td>Fatigue Data</td><td>{'Available' if fatigue_ok else '<span class="pill pill-amber">Validation needed</span>'}</td></tr>
-    <tr><td>Corrosion Data</td><td>{'Available' if corrosion_ok else '<span class="pill pill-amber">Validation needed</span>'}</td></tr>
+    <tr><td>Fatigue Data</td><td>{'Available' if fatigue_ok else '<span class="pill pill-amber">Add measured value</span>'}</td></tr>
+    <tr><td>Corrosion Data</td><td>{'Available' if corrosion_ok else '<span class="pill pill-amber">Add measured value</span>'}</td></tr>
     </table></div>""", unsafe_allow_html=True)
 
     st.markdown(f"""<div class="passport">
     <div class="passport-header">Decision Status</div>
     <p style="margin:4px 0;"><span class="pill {status_class}">{status_text}</span></p>
     </div>""", unsafe_allow_html=True)
+
+    notes = row.get("data_assumption_notes") or row.get("assumption_fields")
+    if notes and str(notes) not in ("", "nan"):
+        with st.expander("Engineering assumptions and source notes"):
+            st.caption(str(notes))
+            st.caption(ASSUMPTION_NOTE)
 
 
 def render_quality_gate(row, subsystem: str = "Structural / Chassis"):
@@ -401,27 +410,17 @@ def _render_source_card(key: str, info: dict, card_class: str = "active"):
 
 def render_empty_state(subsystem: str):
     info = empty_state_info(subsystem, unified, registry_df)
-    sources_html = "".join(f"<li>{esc(s)}</li>" for s in info["trusted_sources"])
-    fields_html = "".join(f"<li>{esc(f.replace('_', ' '))}</li>" for f in info["expected_fields"][:8])
-    registry_html = "".join(
-        f"<li><strong>{esc(r['model_name'])}</strong> — {esc(r['status'])}</li>"
-        for r in info.get("registry_rows", [])[:4]
-    )
+    unlock = SUBSYSTEM_UNLOCK.get(subsystem, "Unlocks subsystem scoring after upload.")
     st.markdown(
         f"""<div class="empty-state">
-        <h3>Waiting for subsystem evidence</h3>
-        <p><strong>{esc(subsystem)}</strong></p>
-        <p>{esc(info['activation_hint'])}</p>
-        <p><strong>Trusted sources that can activate this subsystem:</strong></p>
-        <ul>{sources_html}</ul>
-        <p><strong>Expected fields:</strong></p>
-        <ul>{fields_html}</ul>
-        <p><strong>Model registry:</strong></p>
-        <ul>{registry_html or '<li>No models registered yet</li>'}</ul>
+        <h3>Ready for new evidence</h3>
+        <p><strong>{esc(subsystem)}</strong> — templates, fields, and validation checks are configured.</p>
+        <p><strong>What to add:</strong> {esc(info.get('activation_hint', 'Upload a reviewed CSV below.'))}</p>
+        <p><strong>Unlocks:</strong> {esc(unlock)}</p>
         </div>""",
         unsafe_allow_html=True,
     )
-    st.info("Upload engineer-reviewed evidence in the Evidence Intake tab, or load optional public reference datasets.")
+    st.info("Upload evidence in **Add New Material Evidence** below.")
 
 
 def render_passport_for_subsystem(row, subsystem: str):
@@ -470,7 +469,8 @@ def render_passport_for_subsystem(row, subsystem: str):
     )
 
     if source_type == "computed_database":
-        st.caption("Computed reference only — not experimental validation.")
+        with st.expander("Reference data notes"):
+            st.caption("Reference database values — confirm with lab or supplier data before release.")
 
     st.markdown(
         f"""<div class="passport"><div class="passport-header">Decision Status</div>
@@ -483,49 +483,36 @@ def render_passport_for_subsystem(row, subsystem: str):
 
 with st.sidebar:
     st.markdown("### MatIntel")
-    st.caption("Governed Material Intelligence")
+    st.caption("JLR Material Intelligence")
     st.divider()
     st.markdown(
-        "**L1** Public reference data  \n"
-        "**L2** Evidence upload + review  \n"
-        "**L3** Prediction + uncertainty  \n"
-        "**L4** JLR fit scoring  \n"
-        "**L5** Validation report"
+        f"**Materials:** {hero['unified_materials']:,}  \n"
+        f"**Models:** {hero['active_trained_models']}  \n"
+        f"**Subsystems:** {hero['subsystems_covered']}"
     )
     st.divider()
-    st.markdown(
-        f"**Sources:** {hero['evidence_sources_active']}  \n"
-        f"**Materials:** {hero['unified_materials']}  \n"
-        f"**Trained models:** {hero['active_trained_models']} "
-        f"({hero['experimental_trained_models']} exp + {hero['computed_reference_trained_models']} computed)"
-    )
+    if model_bundle and model_bundle.get("metrics"):
+        st.markdown(f"**Yield model R²:** {M['R2']}")
     st.divider()
-    st.markdown(f"**Best model:** {MODEL_ALGO}  \nR² **{M['R2']}** · MAE **{M['MAE']}** MPa")
-    st.divider()
-    st.caption("Screening only. Not final engineering approval.")
+    st.caption("Screening platform — lab validation before release.")
 
 # ── Hero ─────────────────────────────────────────────────────────────────────
 
 st.markdown("""<div class="hero-block">
 <h1>MatIntel</h1>
-<p class="subtitle">Governed Material Intelligence for JLR Engineering</p>
-<p class="tagline">All unified records are used in the intelligence layer for passport, search, and scoring. MatIntel trains separate property-specific models instead of forcing one universal model across unrelated targets. Computed-reference models are screening tools — validation required before engineering release.</p>
+<p class="subtitle">Unified material intelligence for property prediction, subsystem fit scoring, and validation planning.</p>
+<p class="tagline">MatIntel starts with trusted public material data, trains property-specific models, and lets engineers upload new evidence to improve recommendations.</p>
 </div>""", unsafe_allow_html=True)
 
 st.markdown(f"""<div class="metric-strip">
-<div class="metric-chip"><p class="mv">{hero['evidence_sources_active']}</p><p class="ml">Evidence Sources Active</p></div>
-<div class="metric-chip"><p class="mv">{hero['unified_materials']}</p><p class="ml">Unified Material Records</p></div>
-<div class="metric-chip"><p class="mv">{hero['experimental_ml_rows']}</p><p class="ml">Experimental Training Rows</p></div>
-<div class="metric-chip"><p class="mv">{hero['computed_reference_rows']}</p><p class="ml">Computed/Reference Records</p></div>
-<div class="metric-chip"><p class="mv">{hero['active_trained_models']}</p><p class="ml">Active Trained Models</p></div>
-<div class="metric-chip"><p class="mv">{hero['experimental_trained_models']}</p><p class="ml">Experimental Trained Models</p></div>
-<div class="metric-chip"><p class="mv">{hero['computed_reference_trained_models']}</p><p class="ml">Computed-Reference Trained</p></div>
-<div class="metric-chip"><p class="mv">{hero['waiting_for_evidence']}</p><p class="ml">Waiting for Evidence</p></div>
+<div class="metric-chip"><p class="mv">{hero['unified_materials']:,}</p><p class="ml">Unified Material Records</p></div>
+<div class="metric-chip"><p class="mv">{hero['active_trained_models']}</p><p class="ml">Trained Property Models</p></div>
+<div class="metric-chip"><p class="mv">{hero['model_ready_rows']:,}</p><p class="ml">Model-Ready Properties</p></div>
+<div class="metric-chip"><p class="mv">{hero['subsystems_covered']}</p><p class="ml">Subsystems Covered</p></div>
+<div class="metric-chip"><p class="mv">{hero['upload_templates']}</p><p class="ml">Upload Templates</p></div>
+<div class="metric-chip"><p class="mv">{hero['avg_data_trust']}</p><p class="ml">Avg Data Trust</p></div>
 </div>""", unsafe_allow_html=True)
-st.caption(
-    "Default universe loads from cache. Heavy public datasets can be refreshed below in Evidence Intake. "
-    "All records participate in the intelligence layer; each model trains only on rows with valid targets and features."
-)
+st.caption("Source basis and assumptions are tracked in each material passport.")
 
 # ── Tabs ─────────────────────────────────────────────────────────────────────
 
@@ -539,11 +526,13 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 # ═════════════════════════════════════════════════════════════════════════════
 
 with tab1:
-    st.markdown('<div class="sec-header">Subsystem Intelligence Map</div>', unsafe_allow_html=True)
-    st.caption(
-        "Trusted reference data auto-loads at startup. Counts distinguish tagged rows, "
-        "inferred reference coverage, and experimental training rows."
-    )
+    st.markdown('<div class="sec-header">What Is Loaded</div>', unsafe_allow_html=True)
+    wl1, wl2, wl3 = st.columns(3)
+    wl1.metric("Unified materials", f"{hero['unified_materials']:,}")
+    wl2.metric("Trained property models", hero["active_trained_models"])
+    wl3.metric("Subsystems covered", hero["subsystems_covered"])
+
+    st.markdown('<div class="sec-header">Where It Applies — Subsystem Intelligence Map</div>', unsafe_allow_html=True)
 
     jarvis_5000 = ref_meta.get("jarvis_5000", CACHE_JARVIS_5000.exists())
     if not jarvis_5000 and n_jarvis <= 500:
@@ -593,24 +582,17 @@ with tab1:
             with col:
                 st.markdown(render_subsystem_card_html(card), unsafe_allow_html=True)
 
-    st.markdown('<div class="sec-header">Evidence Sources → Subsystems → Models &amp; Decisions</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec-header">How Data Flows</div>', unsafe_allow_html=True)
     st.markdown(
-        render_evidence_flow_html(
-            unified, registry_df, n_jarvis, n_matbench, n_uploaded, len(unified_base),
-        ),
+        render_evidence_flow_html(len(unified), len(all_models), n_uploaded),
         unsafe_allow_html=True,
     )
 
-    st.markdown('<div class="sec-header">Source-to-Subsystem Coverage</div>', unsafe_allow_html=True)
-    coverage_table = build_coverage_table(unified)
-    st.dataframe(coverage_table, use_container_width=True, hide_index=True)
-    st.caption(
-        "Tagged = explicit application_subsystem. Inferred = property-matched reference rows "
-        "(not hard-tagged). Training = experimental ML-eligible rows."
-    )
+    with st.expander("Subsystem coverage detail", expanded=False):
+        coverage_table = build_coverage_table(unified)
+        st.dataframe(coverage_table, use_container_width=True, hide_index=True)
 
-    # ── Guided upload center ──
-    st.markdown('<div class="sec-header">Upload Reviewed Evidence Source</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec-header">How Engineers Improve It — Add New Material Evidence</div>', unsafe_allow_html=True)
     st.markdown(UPLOAD_GUIDELINES)
 
     with st.expander("Subsystem column guidance", expanded=False):
@@ -631,7 +613,7 @@ with tab1:
                 key=f"dl_tmpl_{i}",
             )
 
-    uploaded_file = st.file_uploader("Upload reviewed evidence CSV", type=["csv"], key="csv_upload")
+    uploaded_file = st.file_uploader("Step 1 — Upload CSV", type=["csv"], key="csv_upload")
 
     if uploaded_file is not None:
         try:
@@ -645,30 +627,10 @@ with tab1:
                 st.warning(f"Truncated to {MAX_UPLOAD_ROWS} rows.")
                 upload_df = upload_df.head(MAX_UPLOAD_ROWS)
 
-            st.markdown("#### Source classification")
-            sc1, sc2, sc3 = st.columns(3)
-            with sc1:
-                chosen_source_type = st.selectbox(
-                    "Source type", ALL_SOURCE_TYPES,
-                    index=ALL_SOURCE_TYPES.index("supplier_sheet"),
-                    key="upload_src_type",
-                )
-            with sc2:
-                subsystem_options = ["infer from file if present"] + ALL_SUBSYSTEMS
-                chosen_subsystem = st.selectbox(
-                    "Application subsystem", subsystem_options, key="upload_subsystem",
-                )
-            with sc3:
-                engineer_reviewed = st.checkbox("Engineer reviewed", key="upload_eng_reviewed")
-
-            infer_sub = chosen_subsystem == "infer from file if present"
-            app_sub = None if infer_sub else chosen_subsystem
-            profile = SOURCE_TYPE_PROFILES[chosen_source_type]
-
             mapping_df = enrich_mapping_with_units(upload_df, suggest_schema_mapping(upload_df))
             needs_confirm = mapping_df[mapping_df["needs_confirmation"] == True]  # noqa: E712
 
-            st.markdown("#### Schema mapping review")
+            st.markdown("#### Step 2 — Review column mapping")
             options = ["ignore"] + STANDARD_FIELDS
             overrides: dict[str, str] = {}
             unit_factors: dict[str, float] = {}
@@ -687,7 +649,7 @@ with tab1:
                         )
 
             if not needs_confirm.empty:
-                st.markdown("#### Mapping Review & Questions — Needs confirmation")
+                st.markdown("#### Mapping questions")
                 st.dataframe(
                     needs_confirm[[
                         "uploaded_column", "suggested_field", "confidence",
@@ -711,8 +673,28 @@ with tab1:
                         key=f"confirm_{col}",
                     )
 
+            st.markdown("#### Step 3 — Confirm units and subsystem")
+            sc1, sc2, sc3 = st.columns(3)
+            with sc1:
+                chosen_source_type = st.selectbox(
+                    "Source type", ALL_SOURCE_TYPES,
+                    index=ALL_SOURCE_TYPES.index("supplier_sheet"),
+                    key="upload_src_type",
+                )
+            with sc2:
+                subsystem_options = ["infer from file if present"] + ALL_SUBSYSTEMS
+                chosen_subsystem = st.selectbox(
+                    "Application subsystem", subsystem_options, key="upload_subsystem",
+                )
+            with sc3:
+                engineer_reviewed = st.checkbox("Engineer reviewed", key="upload_eng_reviewed")
+
+            infer_sub = chosen_subsystem == "infer from file if present"
+            app_sub = None if infer_sub else chosen_subsystem
+            profile = SOURCE_TYPE_PROFILES[chosen_source_type]
+
             engineer_notes = st.text_area(
-                "Engineer review notes (stored in source metadata)",
+                "Engineer review notes",
                 key="upload_eng_notes", placeholder="e.g. Supplier datasheet Rev 3, lab batch 2024-Q2",
             )
 
@@ -738,12 +720,15 @@ with tab1:
             if unresolved:
                 st.warning(f"Unresolved mappings need engineer confirmation: {', '.join(unresolved)}")
 
-            if st.button("Approve and ingest evidence", type="primary", key="approve_ingest"):
+            if st.button("Step 4 — Approve and ingest", type="primary", key="approve_ingest"):
                 if chosen_source_type == "unknown" and not engineer_reviewed:
-                    st.error("Unknown source requires engineer review before ingest.")
+                    st.error("Please confirm source classification before ingest.")
                 elif unresolved:
                     st.error("Confirm all flagged mappings before ingest.")
                 else:
+                    before_materials = len(unified)
+                    sub_for_count = app_sub if app_sub else "General Material Reuse"
+                    before_subsystem = len(filter_subsystem_rows(unified, sub_for_count))
                     mapped, summary = ingest_approved_evidence(
                         upload_df, overrides,
                         source_type=chosen_source_type,
@@ -754,18 +739,76 @@ with tab1:
                         engineer_review_notes=engineer_notes,
                         unit_factors=unit_factors,
                     )
+                    impact = assess_upload_model_impact(mapped, unified, all_models)
+                    summary["before"] = {
+                        "materials": before_materials,
+                        "subsystem_rows": before_subsystem,
+                    }
+                    summary["after"] = {
+                        "materials": before_materials + len(mapped),
+                        "properties_detected": detect_upload_targets(mapped),
+                    }
+                    summary["model_impact"] = impact
                     st.session_state["uploaded_rows"] = pd.concat(
                         [st.session_state["uploaded_rows"], mapped], ignore_index=True,
                     ) if not st.session_state["uploaded_rows"].empty else mapped
                     st.session_state["last_ingest_summary"] = summary
                     st.session_state["upload_confirmations"] = confirmations
-                    st.success(f"Ingested {summary['rows_ingested']} rows · ML eligible: {summary['ml_eligible_rows']}")
+                    st.session_state["pending_retrain"] = impact
+                    st.success(f"Added {summary['rows_ingested']} materials to the universe.")
                     st.rerun()
 
     if st.session_state.get("last_ingest_summary"):
         s = st.session_state["last_ingest_summary"]
-        st.markdown("#### Last ingestion result")
-        st.json(s)
+        st.markdown("#### Upload result")
+        rc1, rc2, rc3, rc4 = st.columns(4)
+        rc1.metric("Rows added", s.get("rows_ingested", 0))
+        rc2.metric("Subsystem", str(s.get("subsystem", "—"))[:24])
+        rc3.metric("Properties detected", len(s.get("after", {}).get("properties_detected", [])))
+        rc4.metric("Universe size", s.get("after", {}).get("materials", len(unified)))
+
+        impacts = s.get("model_impact", {}).get("impacts", [])
+        if impacts:
+            st.markdown("**Model impact**")
+            for imp in impacts:
+                if imp["action"] == "model_retrain_available":
+                    st.success(imp["message"])
+                elif imp["action"] == "trainable_target_detected":
+                    st.info(imp["message"])
+                else:
+                    st.info(imp["message"])
+
+        before = s.get("before", {})
+        st.caption(
+            f"Before → After: {before.get('materials', '—')} → {s.get('after', {}).get('materials', '—')} materials · "
+            f"Scoring coverage improved: {'Yes' if s.get('model_impact', {}).get('scoring_coverage_improved') else 'No'}"
+        )
+
+        pending = st.session_state.get("pending_retrain", {})
+        if pending.get("any_retrain_available"):
+            retrain_keys = [i["model_key"] for i in pending.get("impacts", []) if i["action"] == "model_retrain_available"]
+            for rk in retrain_keys:
+                if st.button(f"Retrain affected model — {rk.replace('_', ' ')}", key=f"retrain_{rk}"):
+                    parts = [unified_base]
+                    if not st.session_state["public_reference_rows"].empty:
+                        parts.append(st.session_state["public_reference_rows"])
+                    if not st.session_state["uploaded_rows"].empty:
+                        parts.append(st.session_state["uploaded_rows"])
+                    train_df = pd.concat(parts, ignore_index=True)
+                    result = retrain_affected_model(rk, train_df)
+                    st.session_state["last_retrain_result"] = result
+                    if result.get("success"):
+                        st.cache_resource.clear()
+                        st.success(
+                            f"Model retrained · R² {result.get('before_r2', '—')} → {result.get('r2')} · "
+                            f"{result.get('rows')} rows"
+                        )
+                    else:
+                        st.info(result.get("message", "More evidence required."))
+                    st.rerun()
+
+        with st.expander("Ingestion details", expanded=False):
+            st.json(s)
 
     # ── Below the fold: optional loaders & diagnostics ──
     with st.expander("Optional reference cache controls (advanced)", expanded=False):
@@ -944,146 +987,99 @@ with tab2:
 # ═════════════════════════════════════════════════════════════════════════════
 
 with tab3:
-    st.markdown('<div class="sec-header">Property-Specific Model Registry</div>', unsafe_allow_html=True)
-    st.caption(
-        "MatIntel trains one model per target/property — not a single universal model across all 8,312 records. "
-        "All rows remain available for passport, search, and scoring."
-    )
-
-    active_df = registry_df[registry_df["status"].isin(["Active", "Active computed-reference"])]
-    trainable_df = registry_df[registry_df["status"].isin([
-        "Trainable", "Trainable next", "Computed-reference trainable",
-    ])]
-    waiting_df = registry_df[registry_df["status"].isin(["Waiting for evidence", "Insufficient data"])]
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Active trained", len(all_models))
-    m2.metric("Experimental", hero["experimental_trained_models"])
-    m3.metric("Computed-reference", hero["computed_reference_trained_models"])
-    m4.metric("Waiting", len(waiting_df))
-
-    st.dataframe(
-        registry_df[[
-            "model_name", "subsystem", "target", "eligible_rows",
-            "status", "model_family", "reason",
-        ]],
-        use_container_width=True, hide_index=True,
-    )
-
-    st.markdown('<div class="sec-header">Active Trained Models</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec-header">Trained Property Models</div>', unsafe_allow_html=True)
+    st.caption("MatIntel trains one model per material property instead of forcing one universal model.")
 
     if not all_models:
-        st.warning(
-            "No trained models on disk. Run `python scripts/bootstrap_data.py` to train "
-            "structural and computed-reference models."
+        st.warning("Run `python scripts/bootstrap_data.py` to train property models.")
+    else:
+        model_keys = list(all_models.keys())
+        labels = [
+            f"{MODEL_CARDS.get(k, {}).get('title', k)} — R² {all_models[k].get('r2', all_models[k].get('metrics', {}).get('R2', '—'))}"
+            for k in model_keys
+        ]
+        sel_idx = st.selectbox("Use this model", range(len(model_keys)), format_func=lambda i: labels[i], key="demo_model_select")
+        model_key = model_keys[sel_idx]
+        bundle = all_models[model_key]
+        card = MODEL_CARDS.get(model_key, {})
+        metrics = bundle.get("metrics", {})
+        unit = bundle.get("unit", "")
+        algo = bundle.get("selected_algorithm", bundle.get("model_name", "—"))
+        target_col = bundle.get("target", "")
+
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1.metric("Rows used", bundle.get("rows", metrics.get("train_rows", "—")))
+        mc2.metric("Best algorithm", algo)
+        mc3.metric("R²", metrics.get("R2", "—"))
+        mc4.metric("MAE / RMSE", f"{metrics.get('MAE', '—')} / {metrics.get('RMSE', '—')}")
+
+        st.markdown(
+            f"""<div class="passport">
+            <table>
+            <tr><td>Model</td><td><strong>{esc(card.get('title', model_key))}</strong></td></tr>
+            <tr><td>Target property</td><td>{esc(card.get('target_label', target_col))}</td></tr>
+            <tr><td>Helps with</td><td>{esc(card.get('helps', '—'))}</td></tr>
+            <tr><td>Model type</td><td>{esc(card.get('family_label', '—'))}</td></tr>
+            </table></div>""",
+            unsafe_allow_html=True,
         )
-    else:
-        for model_key, bundle in all_models.items():
-            spec = MODEL_SPECS.get(model_key, {})
-            family = bundle.get("model_family", spec.get("model_family", "experimental"))
-            is_computed = family == "computed_reference"
-            limitation = bundle.get(
-                "limitation_label",
-                "Computed-reference screening model — validation required before engineering release"
-                if is_computed else "Measured-data prediction",
+
+        test_actuals = bundle.get("test_actuals", [])
+        test_preds = bundle.get("test_predictions", [])
+        if test_actuals and test_preds:
+            fig_sc = go.Figure()
+            fig_sc.add_trace(go.Scatter(
+                x=test_actuals, y=test_preds, mode="markers",
+                marker=dict(size=7, color="#1B4332", opacity=0.65), name="Test holdout",
+            ))
+            lo = min(min(test_actuals), min(test_preds))
+            hi = max(max(test_actuals), max(test_preds))
+            fig_sc.add_trace(go.Scatter(
+                x=[lo, hi], y=[lo, hi], mode="lines",
+                line=dict(dash="dash", color="#B08D57"), name="Perfect prediction",
+            ))
+            fig_sc.update_layout(
+                title="Actual vs predicted", height=320,
+                xaxis_title=f"Actual ({unit})".strip(), yaxis_title=f"Predicted ({unit})".strip(),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
             )
-            unit = bundle.get("unit", "MPa" if model_key == "structural_yield_strength" else "")
-            algo = bundle.get("selected_algorithm", bundle.get("model_name", "—"))
-            metrics = bundle.get("metrics", {})
-            target_col = bundle.get("target", spec.get("target", ""))
-            sources = ", ".join(bundle.get("source_datasets", [])) or "—"
+            st.plotly_chart(fig_sc, use_container_width=True)
 
-            st.markdown(
-                f"""<div class="passport" style="margin-bottom:16px;">
-                <div class="passport-header">{esc(model_key.replace('_', ' ').title())}</div>
-                <table>
-                <tr><td>Target</td><td>{esc(target_col)}</td></tr>
-                <tr><td>Model family</td><td>{esc(family.replace('_', ' '))}</td></tr>
-                <tr><td>Source basis</td><td>{esc(sources)}</td></tr>
-                <tr><td>Rows used</td><td>{bundle.get('rows', metrics.get('train_rows', '—'))}</td></tr>
-                <tr><td>Algorithm</td><td>{esc(algo)}</td></tr>
-                <tr><td>R² / MAE / RMSE</td><td>{metrics.get('R2', '—')} / {metrics.get('MAE', '—')} / {metrics.get('RMSE', '—')}</td></tr>
-                <tr><td>Limitation</td><td>{esc(limitation)}</td></tr>
-                </table></div>""",
-                unsafe_allow_html=True,
-            )
+        importance = bundle.get("feature_importance", {})
+        if importance:
+            imp_df = pd.DataFrame([
+                {"feature": k, "importance": v}
+                for k, v in sorted(importance.items(), key=lambda x: -x[1])[:10]
+            ])
+            fig_imp = px.bar(imp_df, x="importance", y="feature", orientation="h", title="Feature importance")
+            fig_imp.update_layout(height=260, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig_imp, use_container_width=True)
 
-            test_actuals = bundle.get("test_actuals", [])
-            test_preds = bundle.get("test_predictions", [])
-            if test_actuals and test_preds:
-                fig_sc = go.Figure()
-                fig_sc.add_trace(go.Scatter(
-                    x=test_actuals, y=test_preds,
-                    mode="markers", marker=dict(size=7, color="#1B4332", opacity=0.65),
-                    name="Test holdout",
-                ))
-                lo = min(min(test_actuals), min(test_preds))
-                hi = max(max(test_actuals), max(test_preds))
-                fig_sc.add_trace(go.Scatter(
-                    x=[lo, hi], y=[lo, hi],
-                    mode="lines", line=dict(dash="dash", color="#B08D57"),
-                    name="Perfect prediction",
-                ))
-                fig_sc.update_layout(
-                    title=f"Actual vs Predicted — {target_col}",
-                    xaxis_title=f"Actual ({unit})".strip(),
-                    yaxis_title=f"Predicted ({unit})".strip(),
-                    height=320, margin=dict(l=40, r=20, t=40, b=40),
-                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                )
-                st.plotly_chart(fig_sc, use_container_width=True, key=f"scatter_{model_key}")
+        if target_col in unified.columns:
+            candidates = unified[unified[target_col].notna()]["material_id"].tolist()
+            if candidates:
+                mat_id = st.selectbox("Inspect a material", candidates[:500], key=f"pred_mat_{model_key}")
+                row = unified[unified["material_id"] == mat_id].iloc[0]
+                pred_info = predict_with_interval(bundle, row)
+                conf = confidence_score(row, pred_info, bundle)
+                pc1, pc2, pc3 = st.columns(3)
+                pc1.metric("Predicted", f"{pred_info['prediction']} {unit}".strip())
+                pc2.metric("Actual", f"{pred_info['actual']} {unit}".strip() if pred_info["actual"] is not None else "—")
+                pc3.metric("Recommendation confidence", f"{conf['confidence']}%")
 
-            importance = bundle.get("feature_importance", {})
-            if importance:
-                imp_df = pd.DataFrame([
-                    {"feature": k, "importance": v}
-                    for k, v in sorted(importance.items(), key=lambda x: -x[1])[:10]
-                ])
-                fig_imp = px.bar(
-                    imp_df, x="importance", y="feature", orientation="h",
-                    title="Top feature importance",
-                    color_discrete_sequence=["#2D6A4F"],
-                )
-                fig_imp.update_layout(
-                    height=280, margin=dict(l=20, r=20, t=40, b=20),
-                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                )
-                st.plotly_chart(fig_imp, use_container_width=True, key=f"imp_{model_key}")
+        with st.expander("Model provenance and technical details"):
+            st.json({
+                "model_key": model_key,
+                "source_datasets": bundle.get("source_datasets", []),
+                "recommendation_basis": bundle.get("recommendation_basis", ""),
+                "limitation": bundle.get("limitation_label", ""),
+            })
 
-            # Interactive prediction for this model
-            if target_col in unified.columns:
-                candidates = unified[unified[target_col].notna()]["material_id"].tolist()
-                if candidates:
-                    mat_id = st.selectbox(
-                        f"Inspect material — {model_key}",
-                        candidates[:500],
-                        key=f"pred_mat_{model_key}",
-                    )
-                    row = unified[unified["material_id"] == mat_id].iloc[0]
-                    pred_info = predict_with_interval(bundle, row)
-                    conf = confidence_score(row, pred_info, bundle)
-                    pc1, pc2, pc3 = st.columns(3)
-                    pc1.metric("Predicted", f"{pred_info['prediction']} {unit}".strip())
-                    if pred_info["actual"] is not None:
-                        pc2.metric("Actual", f"{pred_info['actual']} {unit}".strip())
-                    else:
-                        pc2.metric("Actual", "—")
-                    pc3.metric("Prediction confidence", f"{conf['confidence']}%")
-            st.divider()
-
-    st.markdown('<div class="sec-header">Models Waiting for Evidence</div>', unsafe_allow_html=True)
-    if waiting_df.empty:
-        st.caption("No models currently waiting.")
-    else:
-        for _, wrow in waiting_df.iterrows():
-            activation = get_model_activation_info(wrow["model_name"], registry_df)
-            st.markdown(
-                f"""<div class="empty-state" style="padding:14px;">
-                <p><strong>{esc(wrow['model_name'])}</strong> — {esc(wrow['status'])}</p>
-                <p>{esc(activation['how_to_activate'])}</p>
-                </div>""",
-                unsafe_allow_html=True,
-            )
+    with st.expander("Full model registry", expanded=False):
+        st.dataframe(
+            registry_df.assign(status=registry_df["status"].map(lambda s: display_status(s))),
+            use_container_width=True, hide_index=True,
+        )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1091,24 +1087,25 @@ with tab3:
 # ═════════════════════════════════════════════════════════════════════════════
 
 with tab4:
-    st.markdown('<div class="sec-header">JLR Fit Scoring</div>', unsafe_allow_html=True)
-    st.caption("Property-aware weighted score — only dimensions with evidence for the selected subsystem.")
+    st.markdown('<div class="sec-header">Choose a JLR Use Case</div>', unsafe_allow_html=True)
 
-    r1, r2, r3 = st.columns(3)
-    with r1:
-        use_case = st.selectbox("Use case preset", list(USE_CASE_PRESETS.keys()), key="rec_usecase")
-    with r2:
-        sel_subsystem = st.selectbox(
-            "Subsystem context", ALL_SUBSYSTEMS,
-            index=ALL_SUBSYSTEMS.index(USE_CASE_PRESETS[use_case]["subsystem"]),
-            key="rec_subsystem",
-        )
-    with r3:
-        min_trust = st.number_input("Min source_trust_score", value=0, min_value=0, max_value=100, key="rec_trust")
+    use_case = st.selectbox("Use case", list(USE_CASE_PRESETS.keys()), key="rec_usecase")
+    preset = USE_CASE_PRESETS[use_case]
+    sel_subsystem = preset["subsystem"]
 
-    sub_profile = SUBSYSTEM_PROFILES.get(sel_subsystem, {})
-    st.caption(f"**Scoring focus:** {sub_profile.get('scoring_focus', '—')}")
-    st.caption(f"**Coverage:** {sub_profile.get('coverage_note', '—')}")
+    st.markdown(f"**{use_case}** — {preset['description']}")
+
+    uc1, uc2, uc3 = st.columns(3)
+    uc1.metric("Subsystem", sel_subsystem.split("/")[0].strip())
+    active_props = [p for p in preset.get("active_properties", []) if p in unified.columns and unified[p].notna().any()]
+    uc2.metric("Active properties", len(active_props))
+    sub_models = get_trained_models_for_subsystem(sel_subsystem)
+    uc3.metric("Model insights", len(sub_models))
+
+    if active_props:
+        st.caption(f"Properties in play: {', '.join(active_props)}")
+
+    min_trust = st.slider("Minimum data trust", 0, 100, 0, key="rec_trust")
 
     min_strength = 0.0
     baseline_density = 7.85
@@ -1127,7 +1124,7 @@ with tab4:
                 min_strength = compute_dynamic_threshold(candidates_ys, strength_mode)
                 st.caption(f"Dynamic threshold: **{min_strength} MPa** ({strength_mode})")
             else:
-                st.caption("No yield strength evidence — strength scoring neutral.")
+                st.caption("Strength scoring uses available yield data when present.")
 
     ranked = recommend_materials(
         unified, subsystem=sel_subsystem, min_strength=min_strength,
@@ -1159,7 +1156,7 @@ with tab4:
                 "upload lightweight candidate evidence for aluminium/magnesium/composite comparison."
             )
 
-        st.markdown('<div class="sec-header">Top Candidates</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec-header">Top Recommendations</div>', unsafe_allow_html=True)
         top3 = ranked.head(3)
         card_cols = st.columns(3)
         sub_score_cols = get_scoring_dimensions(sel_subsystem)
@@ -1226,16 +1223,10 @@ with tab4:
 
 with tab5:
     st.markdown('<div class="sec-header">Validation Report</div>', unsafe_allow_html=True)
+    st.caption("Screening deliverable — recommended next actions for engineering review.")
 
-    rc1, rc2 = st.columns(2)
-    with rc1:
-        report_usecase = st.selectbox("Use case preset", list(USE_CASE_PRESETS.keys()), key="rpt_uc")
-    with rc2:
-        rpt_subsystem = st.selectbox(
-            "Subsystem", ALL_SUBSYSTEMS,
-            index=ALL_SUBSYSTEMS.index(USE_CASE_PRESETS[report_usecase]["subsystem"]),
-            key="rpt_subsystem",
-        )
+    report_usecase = st.selectbox("Use case", list(USE_CASE_PRESETS.keys()), key="rpt_uc")
+    rpt_subsystem = USE_CASE_PRESETS[report_usecase]["subsystem"]
 
     report_strength = 0.0
     report_density = 7.85
@@ -1272,29 +1263,27 @@ with tab5:
 
         report = build_report(
             selected, min_strength=report_strength, use_case=report_usecase,
-            model_metrics=model_bundle["metrics"],
+            model_metrics=(model_bundle or {}).get("metrics", {}),
             n_reference_rows=len(unified_base), n_uploaded_rows=n_uploaded,
             active_model_name=active_name, model_status=model_status,
             model_bundle=model_bundle, subsystem=rpt_subsystem,
             registry_df=registry_df,
         )
 
-        st.markdown(report)
+        st.markdown("#### Material selected")
+        st.markdown(f"**{selected.get('material_name', selected.get('material_id'))}** · Score {selected.get('suitability_score', '—')}")
 
-        with st.expander("Model Registry"):
-            st.dataframe(
-                registry_df[["model_name", "subsystem", "target", "status", "reason"]],
-                use_container_width=True, hide_index=True,
-            )
-
-        with st.expander(f"Property Coverage — {rpt_subsystem}"):
-            matrix = property_coverage_matrix(unified)
-            if rpt_subsystem in matrix.index:
-                st.dataframe(matrix.loc[[rpt_subsystem]].T, use_container_width=True)
-
-        st.markdown('<div class="sec-header">Validation Gate Tracker</div>', unsafe_allow_html=True)
+        st.markdown("#### Validation checklist")
         profile = SUBSYSTEM_PROFILES.get(rpt_subsystem, {})
         for gate in profile.get("validation_gates", [g["gate"] for g in VALIDATION_GATES]):
             st.checkbox(gate, value=False, key=f"gate_{gate}")
 
-        st.download_button("Download Report (.md)", data=report, file_name="matintel_report.md", mime="text/markdown")
+        st.markdown("#### Full report")
+        st.markdown(report)
+
+        with st.expander("Property coverage detail"):
+            matrix = property_coverage_matrix(unified)
+            if rpt_subsystem in matrix.index:
+                st.dataframe(matrix.loc[[rpt_subsystem]].T, use_container_width=True)
+
+        st.download_button("Download report (.md)", data=report, file_name="matintel_report.md", mime="text/markdown")

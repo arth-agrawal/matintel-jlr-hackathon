@@ -22,21 +22,35 @@ STRENGTH_MODES = {
 }
 
 USE_CASE_PRESETS: dict[str, dict] = {
-    "Lightweight Structural Component": {
+    "Lightweight structural replacement": {
         "subsystem": "Structural / Chassis",
-        "description": "Structural body/chassis parts where strength-to-weight ratio is critical.",
+        "description": "Find lighter structural options with strong predicted yield strength.",
+        "active_properties": ["yield_strength_mpa", "density_g_cm3", "youngs_modulus_gpa"],
     },
-    "EV Battery Enclosure / Underbody": {
+    "Battery enclosure screening": {
         "subsystem": "Battery Enclosure / Underbody",
-        "description": "Battery housing requiring corrosion resistance, stiffness, and crash safety.",
+        "description": "Screen enclosure materials using formation energy and structural reference data.",
+        "active_properties": ["formation_energy_per_atom", "density_g_cm3", "corrosion_resistance_score"],
     },
-    "Interior Circular Material": {
+    "Electronics thermal interface": {
+        "subsystem": "Electronics / Thermal Interface",
+        "description": "Rank materials for thermal and electrical interface performance.",
+        "active_properties": ["band_gap_ev", "thermal_conductivity_w_mk", "electrical_insulation_score"],
+    },
+    "Circular interior material": {
         "subsystem": "Interior / Seating / Foam",
-        "description": "Interior trim/panels prioritising recycled content and circularity.",
+        "description": "Prioritise interior materials with circularity and comfort evidence.",
+        "active_properties": ["recycled_content_percent", "comfort_score", "voc_emission_score"],
     },
-    "Balanced Material Reuse": {
+    "Thermal / coating material": {
+        "subsystem": "Coatings / Corrosion Protection",
+        "description": "Screen coatings and thermal materials for corrosion and surface performance.",
+        "active_properties": ["corrosion_resistance_score", "thermal_conductivity_w_mk", "adhesion_score"],
+    },
+    "General material reuse": {
         "subsystem": "General Material Reuse",
-        "description": "Balanced trade-off across performance, sustainability, and supply chain.",
+        "description": "Balanced reuse screening across the full material universe.",
+        "active_properties": ["density_g_cm3", "recyclability_score", "source_trust_score"],
     },
 }
 

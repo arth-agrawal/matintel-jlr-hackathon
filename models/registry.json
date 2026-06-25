@@ -29,7 +29,7 @@
     "recommendation_basis": "observed-data based screening",
     "subsystem": "Structural / Chassis",
     "limitation_label": "Measured-data prediction",
-    "timestamp": "2026-06-25T06:22:54.526750+00:00"
+    "timestamp": "2026-06-25T06:33:18.842719+00:00"
   },
   {
     "model_key": "computed_band_gap",
@@ -59,7 +59,7 @@
     "recommendation_basis": "computed-reference based screening",
     "subsystem": "Electronics / Thermal Interface",
     "limitation_label": "Computed-reference screening model \u2014 validation required before engineering release",
-    "timestamp": "2026-06-25T06:22:56.500499+00:00"
+    "timestamp": "2026-06-25T06:33:20.418112+00:00"
   },
   {
     "model_key": "computed_formation_energy",
@@ -88,7 +88,7 @@
     "recommendation_basis": "computed-reference based screening",
     "subsystem": "Battery Enclosure / Underbody / General Material Reuse",
     "limitation_label": "Computed-reference screening model \u2014 validation required before engineering release",
-    "timestamp": "2026-06-25T06:22:58.174430+00:00"
+    "timestamp": "2026-06-25T06:33:21.780279+00:00"
   },
   {
     "model_key": "elastic_modulus_proxy",
@@ -118,6 +118,6 @@
     "recommendation_basis": "computed-reference based screening",
     "subsystem": "Structural reference / General Material Reuse",
     "limitation_label": "Computed-reference screening model \u2014 validation required before engineering release",
-    "timestamp": "2026-06-25T06:22:59.646470+00:00"
+    "timestamp": "2026-06-25T06:33:23.006483+00:00"
   }
 ]

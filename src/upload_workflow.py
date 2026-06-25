@@ -57,6 +57,10 @@ SUBSYSTEM_TEMPLATE_COLUMNS: dict[str, list[str]] = {
         "corrosion_resistance_score", "salt_spray_hours", "adhesion_score",
         "scratch_resistance_score", "voc_emission_score",
     ],
+    "General Material Reuse": UNIVERSAL_TEMPLATE_COLUMNS + [
+        "density_g_cm3", "yield_strength_mpa", "band_gap_ev", "formation_energy_per_atom",
+        "recyclability_score", "recycled_content_percent", "source_trust_score",
+    ],
 }
 
 AMBIGUOUS_COLUMN_TARGETS: dict[str, list[str]] = {
@@ -69,13 +73,13 @@ AMBIGUOUS_COLUMN_TARGETS: dict[str, list[str]] = {
 DENSITY_UNIT_OPTIONS = ["g/cm³ (default)", "kg/m³ (convert ÷1000)"]
 
 UPLOAD_GUIDELINES = """
-**Accepted format**
-- CSV only · one row = one material or test record
-- Include material name/formula and source context
-- Include subsystem/use case when known
-- Prefer units in column names (e.g. `yield_strength_mpa`, `density_g_cm3`)
+**Add New Material Evidence** — CSV upload in four steps:
+1. **Upload CSV** — one row per material or test record
+2. **Review column mapping** — match your headers to MatIntel fields
+3. **Confirm units and subsystem** — engineer review when ready
+4. **Ingest** — update material universe, scoring, and models
 
-**Recommended universal columns:** material_name, formula, material_family, application_subsystem, source_dataset, source_type, notes
+If the file contains a usable target property, MatIntel can add it to the model registry and retrain the relevant model.
 """
 
 SUBSYSTEM_COLUMN_GUIDANCE: dict[str, str] = {

@@ -72,10 +72,10 @@ def format_field_display(row: Any, field: str, val: Any = None, suffix: str = ""
         else:
             text = f"{esc(str(val))}{suffix}"
         return (
-            f'{text} <span class="pill pill-amber">Assumption / validation needed</span>'
+            f'{text} <span class="pill pill-amber">Assumption tracked</span>'
         )
 
     if val is None or (isinstance(val, float) and math.isnan(val)):
-        return '<span class="pill pill-amber">Validation needed</span>'
+        return '<span class="pill pill-amber">Add measured value</span>'
 
     return f"{esc(str(val))}{suffix}"
