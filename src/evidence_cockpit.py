@@ -196,6 +196,11 @@ def render_evidence_flow_html(
     for i, (title, detail) in enumerate(steps):
         if i > 0:
             html += '<div class="flow-arrow">→</div>'
-        html += f'<div class="flow-col"><div class="flow-node flow-sub"><strong>{esc(title)}</strong><br><small>{esc(detail)}</small></div></div>'
+        html += (
+            f'<div class="flow-card">'
+            f'<div class="flow-title">{esc(title)}</div>'
+            f'<div class="flow-subtitle">{esc(detail)}</div>'
+            f'</div>'
+        )
     html += '</div>'
     return html

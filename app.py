@@ -151,16 +151,38 @@ PREMIUM_CSS = """
 .subsys-card .card-cta { font-size: 0.72rem; color: var(--gold); font-weight: 600; margin-top: 6px; }
 .callout-premium { border: 1px solid var(--gold-muted); border-radius: 10px; padding: 16px 20px;
     background: linear-gradient(135deg, #FFFDF8 0%, white 100%); margin: 12px 0; }
-.flow-section { display: flex; align-items: stretch; gap: 8px; margin: 16px 0; flex-wrap: wrap; }
-.flow-col { flex: 1; min-width: 180px; border: 1px solid var(--border-light); border-radius: 8px;
-    padding: 12px; background: white; }
-.flow-title { font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px;
-    color: var(--gold); margin-bottom: 8px; }
-.flow-node { font-size: 0.78rem; padding: 6px 8px; margin: 4px 0; background: var(--warm-white);
-    border-radius: 6px; border-left: 3px solid var(--green-light); }
-.flow-node.flow-sub { border-left-color: var(--gold); }
-.flow-node.flow-out { border-left-color: var(--racing-green); }
-.flow-arrow { display: flex; align-items: center; font-size: 1.2rem; color: var(--green-mid); font-weight: 700; }
+.flow-section { display: flex; align-items: stretch; gap: 10px; margin: 16px 0; flex-wrap: wrap; }
+.flow-card {
+    flex: 1; min-width: 180px;
+    background: #f7f5ef;
+    border: 1px solid rgba(27, 59, 47, 0.18);
+    border-left: 5px solid #b9975b;
+    border-radius: 14px;
+    padding: 18px 20px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+}
+.flow-title {
+    color: #153f2f !important;
+    font-weight: 800;
+    font-size: 1.05rem;
+    letter-spacing: -0.01em;
+    margin: 0 0 6px;
+    line-height: 1.25;
+}
+.flow-subtitle {
+    color: #5f665f !important;
+    font-weight: 600;
+    font-size: 0.88rem;
+    margin: 0;
+    line-height: 1.35;
+}
+.flow-arrow {
+    display: flex; align-items: center;
+    color: #2f8f68 !important;
+    font-weight: 900;
+    font-size: 2rem;
+    padding: 0 2px;
+}
 section[data-testid="stSidebar"] { background: var(--graphite) !important; }
 section[data-testid="stSidebar"] * { color: rgba(255,255,255,0.85) !important; }
 section[data-testid="stSidebar"] .stMarkdown strong { color: var(--gold-muted) !important; }
